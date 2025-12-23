@@ -44,7 +44,7 @@ from utils.model_registry import get_cls_dict_by_model
 _manda_handler = None
 _camera = None
 _lidar_proc = None
-_engines = {}  # Simpan referensi engine untuk cleanup
+_engines = {}  # Dict[str, TrtYOLO]
 _shutdown_lock = threading.Lock()
 _shutdown_done = False
 
@@ -56,185 +56,27 @@ MISSIONS_REGISTRY = [
     {"name": "speed", "register": speed_register, "run": speed_run, "prefix": "speed"},
 ]
 
-
-def _cleanup_engines():
-    """
-    Cleanup TensorRT engines sebelum CUDA context di-destroy.
-    Harus dipanggil SEBELUM cuda context pop/detach.
-    """
-    global _engines
-    
-    if not _engines:
-        return
-    
-    try:
-        for name, engine in list(_engines.items()):
-            if engine is not None:
-                try:
-                    # Destroy TRT engine explicitly
-                    if hasattr(engine, 'cuda_ctx') and engine.cuda_ctx is not None:
-                        engine.cuda_ctx = None
-                    if hasattr(engine, 'context') and engine.context is not None:
-                        del engine.context
-                    if hasattr(engine, 'engine') and engine.engine is not None:
-                        del engine.engine
-                    if hasattr(engine, 'trt_logger'):
-                        del engine.trt_logger
-                except Exception as e:
-                    pass  # Ignore errors during cleanup
-            _engines[name] = None
-        _engines.clear()
-    except Exception:
-        pass
-
-
-def _cleanup_cuda_context():
-    """
-    Pop dan destroy CUDA context dengan aman.
-    """
-    global _cuda_context
-    
-    if _cuda_context is None:
-        return
-        
-    try:
-        _cuda_context.pop()
-        _cuda_context.detach()
-        _cuda_context = None
-    except Exception:
-        pass
-
-
-def shutdown_handler():
-    """
-    Handler untuk cleanup saat program shutdown.
-    Reset parameter, set mode MANUAL, dan lepas resource.
-    PENTING: Urutan cleanup harus benar untuk menghindari segfault.
-    """
-    global _manda_handler, _camera, _lidar_proc, _shutdown_done
-    
-    # Prevent multiple shutdown calls
-    with _shutdown_lock:
-        if _shutdown_done:
-            return
-        _shutdown_done = True
-    
-    # Gunakan print karena rospy mungkin sudah shutdown
-    print("[SHUTDOWN] Handler triggered. Cleaning up...")
-    
-    # 1. Stop robot movement first (safety)
-    try:
-        if _manda_handler is not None:
-            try:
-                _manda_handler.set_velocity(0, 0)
-            except Exception:
-                pass
-    except Exception:
-        pass
-    
-    # 2. Reset MandaHandler parameters
-    try:
-        if _manda_handler is not None:
-            # Reset parameter ke default aman
-            try:
-                _manda_handler.set_param("MOT_THR_MAX", 35)
-                _manda_handler.set_param("WP_SPEED", 1)
-                _manda_handler.set_param("CRUISE_SPEED", 1)
-            except Exception as e:
-                print(f"[SHUTDOWN] Failed to reset params: {e}")
-            
-            # Set mode MANUAL untuk keamanan
-            try:
-                _manda_handler.set_mode("MANUAL")
-            except Exception as e:
-                print(f"[SHUTDOWN] Failed to set MANUAL mode: {e}")
-            
-            # Reset aktuator jika ada
-            try:
-                if hasattr(_manda_handler, 'relay_trig'):
-                    _manda_handler.relay_trig(0, True)
-                if hasattr(_manda_handler, 'move_cam'):
-                    _manda_handler.move_cam(10, 1500)
-                if hasattr(_manda_handler, 'move_wblast'):
-                    _manda_handler.move_wblast(6, 1800)
-                    _manda_handler.move_wblast(7, 1500)
-            except Exception as e:
-                print(f"[SHUTDOWN] Failed to reset actuators: {e}")
-                
-    except Exception as e:
-        print(f"[SHUTDOWN] Error during manda_handler cleanup: {e}")
-    
-    # 3. Release kamera SEBELUM TRT cleanup
-    try:
-        if _camera is not None:
-            _camera.release()
-            print("[SHUTDOWN] Camera released.")
-    except Exception as e:
-        print(f"[SHUTDOWN] Failed to release camera: {e}")
-    
-    # 4. Tutup semua window OpenCV
-    try:
-        cv2.destroyAllWindows()
-    except Exception:
-        pass
-    
-    # 5. Cleanup TensorRT engines SEBELUM CUDA context
-    print("[SHUTDOWN] Cleaning up TensorRT engines...")
-    try:
-        _cleanup_engines()
-    except Exception as e:
-        print(f"[SHUTDOWN] TRT cleanup error: {e}")
-    
-    # 6. Cleanup CUDA context terakhir
-    print("[SHUTDOWN] Cleaning up CUDA context...")
-    try:
-        _cleanup_cuda_context()
-    except Exception as e:
-        print(f"[SHUTDOWN] CUDA cleanup error: {e}")
-    
-    # 7. Stop LiDAR process jika ada
-    try:
-        _stop_lidar(_lidar_proc)
-    except Exception:
-        pass
-    
-    print("[SHUTDOWN] Cleanup completed.")
-
-
-def signal_handler(signum, frame):
-    """
-    Handler untuk signal SIGINT (Ctrl+C) dan SIGTERM.
-    """
-    sig_name = "SIGINT" if signum == signal.SIGINT else "SIGTERM"
-    print(f"\n[SIGNAL] {sig_name} ({signum}) received. Initiating shutdown.")
-    
-    shutdown_handler()
-    
-    # Exit tanpa memanggil rospy.signal_shutdown untuk menghindari race condition
-    os._exit(0)
-
-
 def build_parser():
     parser = argparse.ArgumentParser("Mission Orchestrator (ROS1 + Waypoint)")
 
-    # Argumen kamera (img_width, img_height, device, dll.)
+    # Argumen kamera
     parser = add_camera_args(parser)
 
-    # Argumen masing-masing misi (dipasang via register())
+    # Argumen masing-masing misi
     for m in MISSIONS_REGISTRY:
         try:
             m["register"](parser)
         except Exception as e:
-            pass  # Will log after rospy init
+            pass
 
-    # Mapping misi via CLI (contoh: 1:pole,2:avoid,3:pole)
+    # Mission plan
     parser.add_argument(
         "--mission-plan",
         default="3-9:avoid",
         help='Mapping "WP_INDEX:mission", contoh: "1:pole,2:avoid,3:pole"'
-    ) #Rentang
+    )
 
-    # Kecepatan default untuk navigasi waypoint ketika tidak ada misi khusus
+    # Navigation speed
     parser.add_argument(
         "--nav-speed",
         type=float,
@@ -242,7 +84,7 @@ def build_parser():
         help="Kecepatan (m/s) saat hanya menuju waypoint tanpa misi khusus."
     )
 
-    # Opsi: mulai dari WP index berapa (default 1 -- lewati home di index 0)
+    # Start WP index
     parser.add_argument(
         "--start-wp-index",
         type=int,
@@ -274,12 +116,236 @@ def build_parser():
 
     return parser
 
+def _cleanup_engines():
+    """
+    FIX: Cleanup TensorRT engines dengan proper reference management.
+    Harus dipanggil SEBELUM CUDA context di-destroy.
+    """
+    global _engines
+    
+    if not _engines:
+        return
+    
+    rospy.loginfo("[CLEANUP] Cleaning up %d TRT engines...", len(_engines))
+    
+    # Get list of engine names to avoid dict modification during iteration
+    engine_names = list(_engines.keys())
+    
+    for name in engine_names:
+        engine = _engines.get(name)
+        if engine is None:
+            continue
+            
+        try:
+            rospy.logdebug("[CLEANUP] Cleaning engine: %s", name)
+            
+            # Cleanup TRT internal structures in correct order
+            # 1. Stream
+            if hasattr(engine, 'stream') and engine.stream is not None:
+                try:
+                    del engine.stream
+                    engine.stream = None
+                except Exception as e:
+                    rospy.logdebug("[CLEANUP] Stream cleanup error for %s: %s", name, e)
+            
+            # 2. Outputs
+            if hasattr(engine, 'outputs') and engine.outputs is not None:
+                try:
+                    del engine.outputs
+                    engine.outputs = None
+                except Exception as e:
+                    rospy.logdebug("[CLEANUP] Outputs cleanup error for %s: %s", name, e)
+            
+            # 3. Inputs
+            if hasattr(engine, 'inputs') and engine.inputs is not None:
+                try:
+                    del engine.inputs
+                    engine.inputs = None
+                except Exception as e:
+                    rospy.logdebug("[CLEANUP] Inputs cleanup error for %s: %s", name, e)
+            
+            # 4. Context
+            if hasattr(engine, 'context') and engine.context is not None:
+                try:
+                    del engine.context
+                    engine.context = None
+                except Exception as e:
+                    rospy.logdebug("[CLEANUP] Context cleanup error for %s: %s", name, e)
+            
+            # 5. Engine
+            if hasattr(engine, 'engine') and engine.engine is not None:
+                try:
+                    del engine.engine
+                    engine.engine = None
+                except Exception as e:
+                    rospy.logdebug("[CLEANUP] Engine cleanup error for %s: %s", name, e)
+            
+            # 6. Logger
+            if hasattr(engine, 'trt_logger'):
+                try:
+                    del engine.trt_logger
+                    engine.trt_logger = None
+                except Exception as e:
+                    rospy.logdebug("[CLEANUP] Logger cleanup error for %s: %s", name, e)
+            
+            # 7. CUDA context reference
+            if hasattr(engine, 'cuda_ctx'):
+                try:
+                    engine.cuda_ctx = None
+                except Exception as e:
+                    rospy.logdebug("[CLEANUP] CUDA ctx cleanup error for %s: %s", name, e)
+                    
+            rospy.logdebug("[CLEANUP] Engine %s cleaned successfully", name)
+            
+        except Exception as e:
+            rospy.logwarn("[CLEANUP] Error cleaning engine %s: %s", name, e)
+        
+        # Remove from dict
+        _engines[name] = None
+
+    _engines.clear()
+    rospy.loginfo("[CLEANUP] All engines cleared")
+
+
+def _cleanup_cuda_context():
+    """
+    FIX: Pop dan destroy CUDA context dengan aman.
+    """
+    global _cuda_context
+    
+    if _cuda_context is None:
+        return
+    
+    try:
+        rospy.loginfo("[CLEANUP] Cleaning up CUDA context...")
+        _cuda_context.pop()
+        _cuda_context.detach()
+        _cuda_context = None
+        rospy.loginfo("[CLEANUP] CUDA context cleaned")
+    except Exception as e:
+        rospy.logwarn("[CLEANUP] CUDA context cleanup error: %s", e)
+
+
+def shutdown_handler():
+    """
+    FIX: Proper shutdown sequence untuk menghindari segfault.
+    Urutan PENTING:
+    1. Stop robot movement (safety)
+    2. Reset FCU parameters
+    3. Release camera
+    4. Close OpenCV windows
+    5. Cleanup TRT engines
+    6. Cleanup CUDA context
+    7. Stop LiDAR
+    """
+    global _manda_handler, _camera, _lidar_proc, _shutdown_done
+    
+    # Prevent multiple shutdown calls
+    with _shutdown_lock:
+        if _shutdown_done:
+            return
+        _shutdown_done = True
+    
+    print("\n[SHUTDOWN] Handler triggered. Cleaning up...")
+    
+    # 1. SAFETY: Stop robot movement first
+    try:
+        if _manda_handler is not None:
+            try:
+                _manda_handler.set_velocity(0, 0)
+                rospy.loginfo("[SHUTDOWN] Robot stopped")
+            except Exception as e:
+                rospy.logwarn("[SHUTDOWN] Failed to stop robot: %s", e)
+    except Exception as e:
+        rospy.logwarn("[SHUTDOWN] Error stopping robot: %s", e)
+    
+    # 2. Reset MandaHandler parameters to safe defaults
+    try:
+        if _manda_handler is not None:
+            rospy.loginfo("[SHUTDOWN] Resetting FCU parameters...")
+            try:
+                _manda_handler.set_param("MOT_THR_MAX", 35)
+                _manda_handler.set_param("WP_SPEED", 1)
+                _manda_handler.set_param("CRUISE_SPEED", 1)
+            except Exception as e:
+                rospy.logwarn("[SHUTDOWN] Failed to reset params: %s", e)
+            
+            # Set mode MANUAL untuk keamanan
+            try:
+                _manda_handler.set_mode("MANUAL")
+                rospy.loginfo("[SHUTDOWN] Mode set to MANUAL")
+            except Exception as e:
+                rospy.logwarn("[SHUTDOWN] Failed to set MANUAL mode: %s", e)
+            
+            # Reset aktuator jika ada
+            try:
+                if hasattr(_manda_handler, 'set_relay'):
+                    _manda_handler.set_relay(0, False)
+                if hasattr(_manda_handler, 'move_servo'):
+                    _manda_handler.move_servo(10, 1500)
+            except Exception as e:
+                rospy.logwarn("[SHUTDOWN] Failed to reset actuators: %s", e)
+                
+    except Exception as e:
+        rospy.logerr("[SHUTDOWN] Error during manda_handler cleanup: %s", e)
+    
+    # 3. Release kamera SEBELUM TRT cleanup
+    try:
+        if _camera is not None:
+            rospy.loginfo("[SHUTDOWN] Releasing camera...")
+            _camera.release()
+            _camera = None
+            rospy.loginfo("[SHUTDOWN] Camera released")
+    except Exception as e:
+        rospy.logwarn("[SHUTDOWN] Failed to release camera: %s", e)
+    
+    # 4. Tutup semua window OpenCV
+    try:
+        rospy.loginfo("[SHUTDOWN] Closing OpenCV windows...")
+        cv2.destroyAllWindows()
+        rospy.loginfo("[SHUTDOWN] OpenCV windows closed")
+    except Exception as e:
+        rospy.logwarn("[SHUTDOWN] Failed to close OpenCV windows: %s", e)
+    
+    # 5. Cleanup TensorRT engines SEBELUM CUDA context
+    try:
+        _cleanup_engines()
+    except Exception as e:
+        rospy.logerr("[SHUTDOWN] TRT cleanup error: %s", e)
+    
+    # 6. Cleanup CUDA context terakhir
+    try:
+        _cleanup_cuda_context()
+    except Exception as e:
+        rospy.logerr("[SHUTDOWN] CUDA cleanup error: %s", e)
+    
+    # 7. Stop LiDAR process jika ada
+    try:
+        _stop_lidar(_lidar_proc)
+    except Exception as e:
+        rospy.logwarn("[SHUTDOWN] LiDAR stop error: %s", e)
+    
+    print("[SHUTDOWN] Cleanup completed.")
+
+
+def signal_handler(signum, frame):
+    """
+    Handler untuk signal SIGINT (Ctrl+C) dan SIGTERM.
+    """
+    sig_name = "SIGINT" if signum == signal.SIGINT else "SIGTERM"
+    print(f"\n[SIGNAL] {sig_name} ({signum}) received. Initiating shutdown.")
+    
+    shutdown_handler()
+    
+    # Exit dengan os._exit untuk menghindari atexit handlers
+    os._exit(0)
+
 
 def parse_plan(plan_str):
     """
-    Parse string mission-plan:
-      - "1:pole,2:avoid" -> {1: "pole", 2: "avoid"}
-      - "1-2:pole, 3-8:avoid"      -> {2: "avoid", 3: "avoid", 4: "avoid"}
+    Parse string mission-plan.
+    Contoh: "1:pole,2:avoid" -> {1: "pole", 2: "avoid"}
+            "2-4:avoid"      -> {2: "avoid", 3: "avoid", 4: "avoid"}
     """
     plan = {}
     if not plan_str:
@@ -320,9 +386,7 @@ def parse_plan(plan_str):
 
 
 def _mission_lookup(name):
-    """
-    Ambil entry misi dari registry berdasarkan nama (case-sensitive).
-    """
+    """Ambil entry misi dari registry berdasarkan nama."""
     for m in MISSIONS_REGISTRY:
         if m["name"] == name:
             return m
@@ -331,7 +395,7 @@ def _mission_lookup(name):
 
 def _ensure_engine_for(prefix, args):
     """
-    Verifikasi & buat TrtYOLO untuk sebuah misi berdasarkan prefix argumen misi.
+    FIX: Verifikasi & buat TrtYOLO dengan proper error handling.
     """
     global _engines
     
@@ -340,7 +404,8 @@ def _ensure_engine_for(prefix, args):
         letter_box = getattr(args, f"{prefix}_letter_box")
         engine_dir = getattr(args, f"{prefix}_engine_dir")
         override_num = getattr(args, f"{prefix}_category_num")
-    except AttributeError:
+    except AttributeError as e:
+        rospy.logwarn("[%s] Missing attribute for engine creation: %s", prefix, e)
         return None
 
     eng_path = os.path.join(engine_dir, f"{model_name}.trt")
@@ -355,31 +420,34 @@ def _ensure_engine_for(prefix, args):
         num_cls = int(override_num)
 
     if not _HAS_CUDA:
-        rospy.logwarn("[%s] CUDA context tidak tersedia; skip preload engine (lanjut tanpa TRT).", prefix)
+        rospy.logwarn("[%s] CUDA context tidak tersedia; skip preload engine.", prefix)
         return None
 
     # Buat engine
-    trt = TrtYOLO(model_name, num_cls, letter_box)
-    
-    # Simpan reference untuk cleanup
-    _engines[prefix] = trt
-
-    # Warmup sederhana (dummy 640x360)
     try:
-        import numpy as np
-        dummy = np.zeros((360, 640, 3), dtype=np.uint8)
-        _ = trt.detect(dummy, 0.10)
-        rospy.loginfo("[%s] TRT warmup sekali (dummy 640x360) OK.", prefix)
-    except Exception as e:
-        rospy.logwarn("[%s] Warmup gagal (lanjut): %s", prefix, e)
+        trt = TrtYOLO(model_name, num_cls, letter_box)
 
-    return trt
+        _engines[prefix] = trt
+        
+        # Warmup sederhana
+        try:
+            import numpy as np
+            dummy = np.zeros((360, 640, 3), dtype=np.uint8)
+            _ = trt.detect(dummy, 0.10)
+            rospy.loginfo("[%s] TRT warmup OK.", prefix)
+        except Exception as e:
+            rospy.logwarn("[%s] Warmup gagal (lanjut): %s", prefix, e)
+        
+        return trt
+        
+    except Exception as e:
+        rospy.logerr("[%s] Failed to create TRT engine: %s", prefix, e)
+        return None
 
 
 def preload_engines(args, mission_plan):
     """
-    Preload engine (TrtYOLO) hanya untuk misi yang muncul di mission_plan.
-    Return dict: {mission_name: engine_or_None}
+    FIX: Preload engines dengan proper error handling.
     """
     used_missions = set(mission_plan.values())
     engines = {}
@@ -395,12 +463,11 @@ def preload_engines(args, mission_plan):
         try:
             engines[name] = _ensure_engine_for(prefix, args)
             if engines[name] is not None:
-                rospy.loginfo("[%s] Engine preloaded.", name)
+                rospy.loginfo("[%s] Engine preloaded successfully.", name)
             else:
-                rospy.loginfo("[%s] Tanpa engine khusus (OK).", name)
+                rospy.loginfo("[%s] No engine (OK for missions without TRT).", name)
         except SystemExit:
             raise
-
         except Exception as e:
             rospy.logwarn("[%s] Gagal preload engine: %s (lanjut tanpa engine)", name, e)
             engines[name] = None
@@ -409,10 +476,7 @@ def preload_engines(args, mission_plan):
 
 
 def wait_for_waypoints(manda):
-    """
-    Tarik waypoints sampai benar-benar ada data (≥ 2 titik).
-    Mengembalikan (lat_array, lon_array).
-    """
+    """Tarik waypoints sampai benar-benar ada data (≥ 2 titik)."""
     while not rospy.is_shutdown():
         got = manda.pull_waypoints()
         lat = getattr(manda, "latitude_array", []) or []
@@ -428,9 +492,7 @@ def wait_for_waypoints(manda):
 
 
 def _preflight_summary(args, cam, manda, mission_plan, engines):
-    """
-    Buat ringkasan preflight: status kamera, waypoints, engine, dan rencana LiDAR.
-    """
+    """Buat ringkasan preflight."""
     cam_ok = cam.isOpened()
     cam_desc = f"{getattr(cam, 'img_width', '?')}x{getattr(cam, 'img_height', '?')}" if cam_ok else "CLOSED"
 
@@ -467,9 +529,7 @@ def _confirm_start(summary_text):
 
 
 def _missions_need_lidar(args, mission_plan):
-    """
-    Tentukan apakah rencana misi membutuhkan LiDAR.
-    """
+    """Tentukan apakah rencana misi membutuhkan LiDAR."""
     used = set(mission_plan.values())
     need = False
     if "pole" in used and bool(getattr(args, "pole_use_lidar", False)):
@@ -477,15 +537,12 @@ def _missions_need_lidar(args, mission_plan):
     return need
 
 
-def _start_lidar_if_needed(args):
-    """
-    Jalankan roslaunch LiDAR jika diminta dan diperlukan.
-    Return Popen process atau None.
-    """
+def _start_lidar_if_needed(args, mission_plan):
+    """Jalankan roslaunch LiDAR jika diminta dan diperlukan."""
     if not bool(getattr(args, "auto_lidar", False)):
         return None
 
-    if not _missions_need_lidar(args, mission_plan=parse_plan(args.mission_plan)):
+    if not _missions_need_lidar(args, mission_plan):
         rospy.loginfo("Auto LiDAR: tidak diperlukan oleh rencana misi (skip).")
         return None
 
@@ -514,14 +571,15 @@ def _stop_lidar(proc):
     if proc is None:
         return
     try:
-        print(f"[SHUTDOWN] Auto LiDAR: stopping (PID={proc.pid})...")
+        rospy.loginfo(f"[SHUTDOWN] Auto LiDAR: stopping (PID={proc.pid})...")
         os.killpg(os.getpgid(proc.pid), signal.SIGINT)
         try:
             proc.wait(timeout=5)
         except Exception:
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-    except Exception:
-        pass
+        rospy.loginfo("[SHUTDOWN] LiDAR stopped")
+    except Exception as e:
+        rospy.logwarn("[SHUTDOWN] LiDAR stop error: %s", e)
 
 
 def main():
@@ -543,9 +601,6 @@ def main():
     
     # Register atexit handler (backup)
     atexit.register(shutdown_handler)
-    
-    # JANGAN register rospy.on_shutdown - bisa menyebabkan race condition
-    # rospy.on_shutdown(shutdown_handler)
 
     # Kamera tunggal untuk semua misi
     cam = Camera(args)
@@ -562,12 +617,12 @@ def main():
     _manda_handler = manda
     manda.current_wp_index = -1
 
-    # Preload engines (termasuk warmup)
+    # Preload engines
     try:
         engines = preload_engines(args, mission_plan)
         # Update global reference
         for name, eng in engines.items():
-            if eng is not None:
+            if eng is not None and name not in _engines:
                 _engines[name] = eng
     except SystemExit as e:
         rospy.logerr(str(e))
@@ -584,7 +639,7 @@ def main():
         return 0
 
     # Auto-start LiDAR bila diminta & diperlukan
-    lidar_proc = _start_lidar_if_needed(args)
+    lidar_proc = _start_lidar_if_needed(args, mission_plan)
     _lidar_proc = lidar_proc
 
     # Auto set mode + arm
@@ -655,6 +710,7 @@ def main():
 
                 engine = engines.get(mission_name)
 
+                # Block mission execution
                 j = i
                 while j < len(lat) and mission_plan.get(j) == mission_name:
                     j += 1
@@ -668,6 +724,8 @@ def main():
                     ok = run(manda, lat_mission, lon_mission, args, cam, engine)
                 except Exception as e:
                     rospy.logwarn("[WP %d..%d] run %s error: %s", start_idx, end_idx, mission_name, e)
+                    import traceback
+                    traceback.print_exc()
                     ok = False
 
                 if hasattr(manda, "report"):
@@ -683,6 +741,7 @@ def main():
                 i = int(end_idx + 1)
 
             else:
+                # No mission - regular navigation
                 try:
                     manda.move(lat[i], lon[i], speed=float(args.nav_speed))
                 except Exception as e:
@@ -721,7 +780,4 @@ def main():
 
 if __name__ == "__main__":
     ret = main()
-    # Gunakan os._exit untuk menghindari cleanup atexit yang bisa cause segfault
-    # karena shutdown_handler sudah dipanggil secara eksplisit
     os._exit(ret)
-
