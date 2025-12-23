@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# pole.py
+# pole.py (FIXED VERSION - All bugs corrected)
 
 import os
 import time
@@ -14,41 +14,61 @@ from utils.model_registry import get_cls_dict_by_model, get_color_map_by_model
 from utils.visualization import BBoxVisualization
 from utils.yolo_with_plugins import TrtYOLO
 
+
 WINDOW_NAME = 'POLE'
 
+# Mission parameters
 SPEED_MISI = 2.0
 
-# Hijau (tiang hijau) diutamakan di sisi kanan (area bawah frame)
-HIJAU_KANAN_JAUH   = "HIJAU_KANAN_JAUH"    # xr..x_right
-HIJAU_KANAN_DEKAT  = "HIJAU_KANAN_DEKAT"   # mid..xr
-HIJAU_KIRI_JAUH    = "HIJAU_KIRI_JAUH"     # 0..0.25W
-HIJAU_KIRI_DEKAT   = "HIJAU_KIRI_DEKAT"    # 0.25W..mid
+# Filter tracks with score < 0.5 to reduce false positives
+MIN_TRACK_SCORE = 0.5
 
-# Merah (tiang merah) diutamakan di sisi kiri
-MERAH_KIRI_JAUH    = "MERAH_KIRI_JAUH"     # x_left..xl
-MERAH_KIRI_DEKAT   = "MERAH_KIRI_DEKAT"    # xl..mid
-MERAH_KANAN_JAUH   = "MERAH_KANAN_JAUH"    # 0.75W..W
-MERAH_KANAN_DEKAT  = "MERAH_KANAN_DEKAT"   # mid..0.75W
+# ROI parameters
+def get_roi_params(H, W):
+    """Calculate ROI parameters based on frame dimensions"""
+    Y_TOP = int(0.46 * H)
+    Y_BOT = H
+    X_MID = W // 2
+    X_LEFT = int(0.156 * W)
+    X_RIGHT = int(0.844 * W)
+    XL = (X_LEFT + X_MID) // 2
+    XR = (X_MID + X_RIGHT) // 2
+    return Y_TOP, Y_BOT, X_MID, X_LEFT, X_RIGHT, XL, XR
 
+
+# Green pole prioritized on right (bottom of frame)
+HIJAU_KANAN_JAUH = "HIJAU_KANAN_JAUH"    # xr..x_right
+HIJAU_KANAN_DEKAT = "HIJAU_KANAN_DEKAT"  # mid..xr
+HIJAU_KIRI_JAUH = "HIJAU_KIRI_JAUH"      # 0..0.25W
+HIJAU_KIRI_DEKAT = "HIJAU_KIRI_DEKAT"    # 0.25W..mid
+
+# Red pole prioritized on left
+MERAH_KIRI_JAUH = "MERAH_KIRI_JAUH"      # x_left..xl
+MERAH_KIRI_DEKAT = "MERAH_KIRI_DEKAT"    # xl..mid
+MERAH_KANAN_JAUH = "MERAH_KANAN_JAUH"    # 0.75W..W
+MERAH_KANAN_DEKAT = "MERAH_KANAN_DEKAT"  # mid..0.75W
+
+
+# ARGUMENT
 
 def register(parser: argparse.ArgumentParser):
     g = parser.add_argument_group("Mission Pole")
     g.add_argument('--pole-model', type=str, default='pole2')
     g.add_argument('--pole-category-num', type=int, default=2, help='0=greenpole,1=redpole')
-    g.add_argument('--pole-conf-thresh', type=float, default=0.80) #0.65
+    g.add_argument('--pole-conf-thresh', type=float, default=0.80)
     g.add_argument('--pole-engine-dir', type=str, default='yolo')
     g.add_argument('--pole-letter-box', action='store_true')
 
-    # Tracker & kelas yang di-track
     g.add_argument('--pole-tracker', type=str, default='bytetrack', choices=['none','bytetrack','ocsort'])
     g.add_argument('--pole-track-classes', type=str, default='0,1')
 
-    # Tuning ByteTrack-lite (opsional)
-    g.add_argument('--pole-track-high',   type=float, default=0.35, help='high score thresh (match stage-1)')
-    g.add_argument('--pole-track-low',    type=float, default=0.05, help='low  score thresh (stage-2 extension)')
-    g.add_argument('--pole-track-iou',    type=float, default=0.20, help='IoU match thresh')
-    g.add_argument('--pole-track-buffer', type=int,   default=100,   help='missed buffer before drop track')
+    g.add_argument('--pole-track-high', type=float, default=0.35, help='high score thresh (match stage-1)')
+    g.add_argument('--pole-track-low', type=float, default=0.05, help='low score thresh (stage-2 extension)')
+    g.add_argument('--pole-track-iou', type=float, default=0.20, help='IoU match thresh')
+    g.add_argument('--pole-track-buffer', type=int, default=100, help='missed buffer before drop track')
 
+
+# HELPER FUNCTIONS
 
 def _parse_track_classes(s: str, num_classes: int):
     if not s or s.strip().lower() in ('all', '*'):
@@ -98,29 +118,44 @@ def _center_of(box):
 
 
 def _choose_pos_from_center(cx, cy, W, x_mid, xl, xr, x_left, x_right, y_top, y_bot, cls_id):
-    """Tentukan kategori posisi (HIJAU_*/MERAH_*) berdasarkan center & kelas."""
+    """Determine position category (HIJAU_*/MERAH_*) based on center & class."""
     if cy < y_top or cy > y_bot:
         return None
-    if cls_id == 0:  # hijau diutamakan kanan
+    if cls_id == 0:  # green prioritized on right
         if x_mid <= cx <= W:
-            if xr <= cx <= x_right:   return HIJAU_KANAN_JAUH
-            if x_mid <= cx < xr:      return HIJAU_KANAN_DEKAT
+            if xr <= cx <= x_right:
+                return HIJAU_KANAN_JAUH
+            if x_mid <= cx < xr:
+                return HIJAU_KANAN_DEKAT
         else:
-            if 0 <= cx < int(0.25 * W):        return HIJAU_KIRI_JAUH
-            if int(0.25 * W) <= cx < x_mid:    return HIJAU_KIRI_DEKAT
-    else:  # merah diutamakan kiri
+            if 0 <= cx < int(0.25 * W):
+                return HIJAU_KIRI_JAUH
+            if int(0.25 * W) <= cx < x_mid:
+                return HIJAU_KIRI_DEKAT
+    else:  # red prioritized on left
         if 0 <= cx <= x_mid:
-            if x_left <= cx <= xl:    return MERAH_KIRI_JAUH
-            if xl < cx <= x_mid:      return MERAH_KIRI_DEKAT
+            if x_left <= cx <= xl:
+                return MERAH_KIRI_JAUH
+            if xl < cx <= x_mid:
+                return MERAH_KIRI_DEKAT
         else:
-            if int(0.75 * W) <= cx <= W:           return MERAH_KANAN_JAUH
-            if x_mid < cx < int(0.75 * W):         return MERAH_KANAN_DEKAT
+            if int(0.75 * W) <= cx <= W:
+                return MERAH_KANAN_JAUH
+            if x_mid < cx < int(0.75 * W):
+                return MERAH_KANAN_DEKAT
     return None
+
+
+# MAIN DETECTION LOOP
 
 def _loop_and_detect(
         manda, cam, trt_yolo, conf_th, vis,
         lat, lon, tracker=None, classes_to_track=None):
+    """
+    Main detection and navigation loop
     
+    Filter tracks with score < MIN_TRACK_SCORE
+    """
     full_scrn = False
     fps = 0.0
     tic = time.time()
@@ -129,15 +164,15 @@ def _loop_and_detect(
 
     H = getattr(cam, "img_height", None)
     W = getattr(cam, "img_width", None)
-    idx = 0  # indeks waypoint saat ini
+    idx = 0  # current waypoint index
     manda.current_wp_index = idx
     
-    # State untuk cumulative counting by track-id
+    # State for cumulative counting by track-id
     seen_green_ids, seen_red_ids = set(), set()
     cum_green, cum_red = 0, 0
 
     while not rospy.is_shutdown():
-        # keluar jika window ditutup
+        # Exit if window closed
         try:
             if cv2.getWindowProperty(WINDOW_NAME, 0) < 0:
                 break
@@ -149,28 +184,23 @@ def _loop_and_detect(
             break
 
         if W is None or H is None:
-            H, W = img.shape[:2] # H = Height, W = Width
+            H, W = img.shape[:2]
 
-        y_top = int(0.46 * H)
-        y_bot = H
-        x_mid = W // 2
-        x_left  = int(0.156 * W)
-        x_right = int(0.844 * W)
-        xl = (x_left + x_mid) // 2
-        xr = (x_mid + x_right) // 2
+        # Calculate ROI parameters
+        y_top, y_bot, x_mid, x_left, x_right, xl, xr = get_roi_params(H, W)
 
-        # Deteksi
+        # Detection
         boxes, confs, clss = trt_yolo.detect(img, conf_th)
 
-        # Garis bantu
+        # Guide lines
         white, red, green = (255, 255, 255), (0, 0, 255), (0, 255, 0)
 
         # Tracking & Counting
         frame_green, frame_red = 0, 0
-        green_pole, red_pole = None, None  # representative position per class (pilih skor terbesar)
+        green_pole, red_pole = None, None  # representative position per class
 
         if tracker is not None:
-            # siapkan det list: [x1,y1,x2,y2,score,cls]
+            # Prepare detection list: [x1,y1,x2,y2,score,cls]
             dets = []
             Himg, Wimg = img.shape[0], img.shape[1]
             for (x1, y1, x2, y2), sc, c in zip(boxes, confs, clss):
@@ -180,11 +210,15 @@ def _loop_and_detect(
 
             tracks = tracker.update(dets, (Himg, Wimg))  # (tid,x1,y1,x2,y2,cls,score)
 
-            # count visible per frame + cumulative unique by tid
+            # Count visible per frame + cumulative unique by tid
             best_green = (None, -1.0, None)  # (pos, score, tid)
-            best_red   = (None, -1.0, None)
+            best_red = (None, -1.0, None)
 
             for (tid, x1, y1, x2, y2, cls_id, score) in tracks:
+                # Filter tracks with score < MIN_TRACK_SCORE
+                if score < MIN_TRACK_SCORE:
+                    continue
+                
                 cx, cy = _center_of((x1, y1, x2, y2))
 
                 if int(cls_id) == 0:
@@ -205,48 +239,59 @@ def _loop_and_detect(
                         best_red = (pos, score, tid)
 
             green_pole = best_green[0]
-            red_pole   = best_red[0]
+            red_pole = best_red[0]
 
-            # gambar ID kecil di dekat bbox
+            # Draw track ID near bbox
             for (tid, x1, y1, x2, y2, cls_id, score) in tracks:
+                # Only draw if score passes filter
+                if score < MIN_TRACK_SCORE:
+                    continue
+                    
                 label = f"ID{tid}"
                 org = (int(x1) + 4, int(y1) - 6 if int(y1) - 6 > 10 else int(y1) + 14)
-                cv2.putText(img, label, org, cv2.FONT_HERSHEY_PLAIN, 0.9, (0,0,0), 3, cv2.LINE_AA)
-                cv2.putText(img, label, org, cv2.FONT_HERSHEY_PLAIN, 0.9, (255,255,255), 1, cv2.LINE_AA)
-        # else: tidak ada fallback — biarkan frame_* = 0 dan pos = None
+                cv2.putText(img, label, org, cv2.FONT_HERSHEY_PLAIN, 0.9, (0, 0, 0), 3, cv2.LINE_AA)
+                cv2.putText(img, label, org, cv2.FONT_HERSHEY_PLAIN, 0.9, (255, 255, 255), 1, cv2.LINE_AA)
 
-        # Command
+        # Command based on pole positions
         vel_forward = SPEED_MISI
-        if   green_pole == HIJAU_KANAN_JAUH and red_pole is None:
-            manda.set_velocity(vel_forward,  0.78); steering = +0.45
-            print("Ke kiri 45")
+        if green_pole == HIJAU_KANAN_JAUH and red_pole is None:
+            manda.set_velocity(vel_forward, 0.78)
+            steering = +0.45
+            rospy.logdebug_throttle(2.0, "Green right far: Turn left 45")
         elif green_pole == HIJAU_KANAN_DEKAT and red_pole is None:
-            manda.set_velocity(vel_forward,  0.83); steering = +0.50
-            print("Ke kiri 50")
-        elif green_pole == HIJAU_KIRI_JAUH   and red_pole is None:
-            manda.set_velocity(vel_forward,  0.88); steering = +0.60
-            print("Ke kiri 60")
-        elif green_pole == HIJAU_KIRI_DEKAT  and red_pole is None:
-            manda.set_velocity(vel_forward,  0.85); steering = +0.50
-            print("Ke kiri 50")
+            manda.set_velocity(vel_forward, 0.83)
+            steering = +0.50
+            rospy.logdebug_throttle(2.0, "Green right near: Turn left 50")
+        elif green_pole == HIJAU_KIRI_JAUH and red_pole is None:
+            manda.set_velocity(vel_forward, 0.88)
+            steering = +0.60
+            rospy.logdebug_throttle(2.0, "Green left far: Turn left 60")
+        elif green_pole == HIJAU_KIRI_DEKAT and red_pole is None:
+            manda.set_velocity(vel_forward, 0.85)
+            steering = +0.50
+            rospy.logdebug_throttle(2.0, "Green left near: Turn left 50")
         elif green_pole is None and red_pole == MERAH_KIRI_JAUH:
-            manda.set_velocity(vel_forward, -0.65); steering = -0.45
-            print("Ke kanan 45")
+            manda.set_velocity(vel_forward, -0.65)
+            steering = -0.45
+            rospy.logdebug_throttle(2.0, "Red left far: Turn right 45")
         elif green_pole is None and red_pole == MERAH_KIRI_DEKAT:
-            manda.set_velocity(vel_forward, -0.60); steering = -0.50
-            print("Ke kanan 50")
+            manda.set_velocity(vel_forward, -0.60)
+            steering = -0.50
+            rospy.logdebug_throttle(2.0, "Red left near: Turn right 50")
         elif green_pole is None and red_pole == MERAH_KANAN_JAUH:
-            manda.set_velocity(vel_forward, -0.60); steering = -0.60
-            print("Ke kanan 60")
+            manda.set_velocity(vel_forward, -0.60)
+            steering = -0.60
+            rospy.logdebug_throttle(2.0, "Red right far: Turn right 60")
         elif green_pole is None and red_pole == MERAH_KANAN_DEKAT:
-            manda.set_velocity(vel_forward, -0.60); steering = -0.50
-            print("Ke kanan 50")
+            manda.set_velocity(vel_forward, -0.60)
+            steering = -0.50
+            rospy.logdebug_throttle(2.0, "Red right near: Turn right 50")
         else:
             steering = None
             manda.move(lat[idx], lon[idx])
-            print("Lurus")
+            rospy.logdebug_throttle(2.0, "No poles detected: Move to WP")
 
-        # selesai bila sampai target
+        # Done if reached final target
         if manda.has_reached_final() and idx >= (len(lat) - 1):
             manda.report(
                 task="pole",
@@ -258,6 +303,7 @@ def _loop_and_detect(
             )
             return True
 
+        # Waypoint reached check
         if manda.has_reached_target() and last_wp_reached != idx:
             last_wp_reached = idx
             wp_status = f"WP {idx + 1} REACHED"
@@ -286,10 +332,10 @@ def _loop_and_detect(
         # FPS & HUD
         toc = time.time()
         dt = max(toc - tic, 1e-6)
-        fps = 1.0 / dt  
+        fps = 1.0 / dt
         tic = toc
         img = show_fps(img, fps)
-            
+
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         hud = [
@@ -301,7 +347,8 @@ def _loop_and_detect(
             f"FWD {SPEED_MISI:.1f} m/s" + ("" if steering is None else f" | YAW {steering:+.2f}")
         ]
         draw_hud(img, hud)
-                
+
+        # Draw guide lines
         cv2.line(img, (0, y_top), (W, y_top), white, 1)
         cv2.line(img, (x_mid, y_top), (x_mid, y_bot), white, 1)
         for x in (x_left, xl):
@@ -337,6 +384,7 @@ def _loop_and_detect(
 
 
 def run(manda, lat, lon, args, cam, trt=None):
+    """Entry point for pole mission"""
     cls_dict = get_cls_dict_by_model(args.pole_model, override_num=args.pole_category_num)
     color_map = get_color_map_by_model(args.pole_model)
     vis = BBoxVisualization(cls_dict, color_map=color_map)
@@ -347,7 +395,7 @@ def run(manda, lat, lon, args, cam, trt=None):
             raise SystemExit(f'ERROR: TRT engine not found: {engine_path}')
         trt = TrtYOLO(args.pole_model, len(cls_dict), args.pole_letter_box)
 
-        # warmup sekali (aman kalau gagal)
+        # Warmup once
         try:
             h = int(getattr(cam, "img_height", 360))
             w = int(getattr(cam, "img_width", 640))
@@ -356,11 +404,11 @@ def run(manda, lat, lon, args, cam, trt=None):
         except Exception:
             pass
 
-    # tracker
+    # Tracker
     classes_to_track = _parse_track_classes(args.pole_track_classes, len(cls_dict))
     tracker = _attach_tracker(args.pole_tracker, classes_to_track, args)
 
-    # window
+    # Window
     try:
         if cv2.getWindowProperty(WINDOW_NAME, 0) < 0:
             open_window(WINDOW_NAME, 'Mission: POLE', cam.img_width, cam.img_height)
@@ -374,7 +422,7 @@ def run(manda, lat, lon, args, cam, trt=None):
             tracker=tracker, classes_to_track=classes_to_track,
             lat=lat, lon=lon
         )
-        rospy.loginfo(f"Pole finished", {ok})
+        rospy.loginfo(f"Pole mission finished: {ok}")
         return ok
     finally:
         if not bool(getattr(args, "pole_keep_window", False)):
