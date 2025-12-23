@@ -1,4 +1,4 @@
-# avoid.py (no FSM)
+# avoid.py
 #!/usr/bin/env python3
 
 import os
@@ -15,14 +15,30 @@ from utils.visualization import BBoxVisualization
 from utils.yolo_with_plugins import TrtYOLO
 from utils.utils_avoid import UTILS_MISI_AVOID
 
-WINDOW_NAME = 'AVOID'
-SPEED_MISI  = 2.0
-MAX_ANGULAR_VEL = 1.0  # dipakai di fase END
 
+WINDOW_NAME = 'AVOID'
+
+# Mission parameters
+SPEED_MISI = 2.0
+MAX_ANGULAR_VEL = 1.0  # Used in END phase
+
+# Waypoint ranges
 START_RANGE = 2
 END_RANGE = 3
 BACK_RANGE = 2
 
+def get_roi_params(H, W):
+    """Calculate ROI parameters based on frame dimensions"""
+    Y_ROI = 240
+    KONSTANTA_BOLA = 100
+    return Y_ROI, KONSTANTA_BOLA
+
+# Trapezoid ROI parameters
+TRAP_TOP_HALF_WIDTH = 80 # Half-width at top (y = H/2)
+TRAP_BOTTOM_HALF_RATIO = 0.5  # Bottom half-width as ratio of W
+
+
+# ARGUMENT
 
 def register(parser: argparse.ArgumentParser):
     g = parser.add_argument_group("Mission Avoid")
@@ -49,13 +65,14 @@ def register(parser: argparse.ArgumentParser):
     g.add_argument('--avoid-allow-end', type=str, default='blackball,greenlight,redlight',
                    help='kelas diizinkan pada fase END (nama, koma, atau "all")')
     g.add_argument('--avoid-back-mode', action='store_true',
-                   help='aktifkan urutan kebalikan: END --> START (mode BACK)')
+                   help='aktifkan urutan kebalikan: END ke START (mode BACK)')
         
     # threshold per kelas: "greenlight:0.25,redlight:0.25"
     g.add_argument('--avoid-class-thresh', type=str, default='greenball:0.4',
                     help='override conf thresh per kelas, format "name:0.3,name:0.2"')
-    
 
+
+# HELPER FUNCTIONS
 def _parse_track_classes(s: str, num_classes: int):
     if not s or s.strip().lower() in ('all', '*'):
         return None
@@ -140,27 +157,22 @@ def _center_of(box):
 
 def _point_in_trapezoid(px, py, W, H, top_half_width=40, bottom_half_width=None):
     """
-    Cek apakah titik (px, py) berada di dalam ROI trapesium sama kaki.
-    Trapesium:
-      - Tinggi: dari y = H/2 (atas) sampai y = H (bawah)
-      - Atas: lebih sempit (top_half_width dari pusat)
-      - Bawah: lebih lebar (bottom_half_width dari pusat, default W/2)
+    Check if point (px, py) is inside trapezoid ROI.
     
-    Returns True jika titik di dalam trapesium.
+    Applied trapezoid ROI filter to gb/rb/bb_terdekat
     """
     if bottom_half_width is None:
-        bottom_half_width = W // 2  # Lebar penuh di bawah
+        bottom_half_width = W // 2
     
     y_top = H // 2
     y_bottom = H
     x_center = W // 2
     
-    # Cek apakah y dalam range trapesium
+    # Check y range
     if not (y_top <= py <= y_bottom):
         return False
     
-    # Interpolasi lebar berdasarkan posisi y
-    # progress 0 = di atas (sempit), progress 1 = di bawah (lebar)
+    # Interpolate width based on y position
     progress = (py - y_top) / (y_bottom - y_top)
     half_width_at_y = top_half_width + progress * (bottom_half_width - top_half_width)
     
@@ -170,9 +182,7 @@ def _point_in_trapezoid(px, py, W, H, top_half_width=40, bottom_half_width=None)
     return x_left <= px <= x_right
 
 def _draw_trapezoid_roi(img, W, H, top_half_width=40, bottom_half_width=None, color=(0, 255, 0), thickness=2):
-    """
-    Gambar ROI trapesium sama kaki di frame.
-    """
+    """Draw trapezoid ROI on frame"""
     if bottom_half_width is None:
         bottom_half_width = W // 2
     
@@ -180,23 +190,19 @@ def _draw_trapezoid_roi(img, W, H, top_half_width=40, bottom_half_width=None, co
     y_bottom = H
     x_center = W // 2
     
-    # 4 titik sudut trapesium (clockwise dari kiri atas)
+    # 4 corner points (clockwise from top-left)
     pts = np.array([
-        [x_center - top_half_width, y_top],       # kiri atas
-        [x_center + top_half_width, y_top],       # kanan atas
-        [x_center + bottom_half_width, y_bottom], # kanan bawah
-        [x_center - bottom_half_width, y_bottom]  # kiri bawah
+        [x_center - top_half_width, y_top],
+        [x_center + top_half_width, y_top],
+        [x_center + bottom_half_width, y_bottom],
+        [x_center - bottom_half_width, y_bottom]
     ], dtype=np.int32)
     
     cv2.polylines(img, [pts], isClosed=True, color=color, thickness=thickness)
     return img
 
 def _filter_by_allowed(boxes, confs, clss, conf_th, per_cls_thresh, allowed_ids):
-    """
-    Filter deteksi berdasarkan:
-    - allowed_ids (set ID kelas atau None)
-    - threshold global + per-kelas
-    """
+    """Filter detections based on allowed classes and thresholds"""
     if allowed_ids is None and not per_cls_thresh:
         return boxes, confs, clss
 
@@ -216,12 +222,16 @@ def _filter_by_allowed(boxes, confs, clss, conf_th, per_cls_thresh, allowed_ids)
     return fb, fc, fk
 
 def _clamp(value, min_val, max_val):
-    """Clamp nilai ke range [min_val, max_val]"""
+    """Clamp value to range [min_val, max_val]"""
     return max(min_val, min(value, max_val))
 
+
+# MISSION PHASE
 def _avoid_start_step(img, manda, W, H, boxes, confs, clss, name2id, utils_avoid, GAIN_YAW, Y_ROI):
     """
-    Fase START
+    START phase navigation
+    
+    Applied trapezoid ROI filter to all ball detections
     """
     vel_forward = SPEED_MISI
     
@@ -242,26 +252,41 @@ def _avoid_start_step(img, manda, W, H, boxes, confs, clss, name2id, utils_avoid
     rb_terdekat = utils_avoid.pilih_bola_terdekat(list_rb)
     bb_terdekat = utils_avoid.pilih_bola_terdekat(list_bb)
 
-    # Convert ke titik tengah bbox dulu
+    # Convert to bbox center first
     gb_terdekat = utils_avoid.cari_titik_tengah_bbox(gb_terdekat)
     rb_terdekat = utils_avoid.cari_titik_tengah_bbox(rb_terdekat)
     bb_terdekat = utils_avoid.cari_titik_tengah_bbox(bb_terdekat)
     
-    # Filter berdasarkan Y_ROI (hanya jika tidak None dan y > Y_ROI)
+    # Apply trapezoid ROI filter
+    trap_top = TRAP_TOP_HALF_WIDTH
+    trap_bottom = int(TRAP_BOTTOM_HALF_RATIO * W)
+    
+    if gb_terdekat is not None:
+        if not _point_in_trapezoid(gb_terdekat[0], gb_terdekat[1], W, H, trap_top, trap_bottom):
+            gb_terdekat = None
+    
+    if rb_terdekat is not None:
+        if not _point_in_trapezoid(rb_terdekat[0], rb_terdekat[1], W, H, trap_top, trap_bottom):
+            rb_terdekat = None
+    
+    if bb_terdekat is not None:
+        if not _point_in_trapezoid(bb_terdekat[0], bb_terdekat[1], W, H, trap_top, trap_bottom):
+            bb_terdekat = None
+    
+    # Filter based on Y_ROI
     gb_terdekat = gb_terdekat if (gb_terdekat is not None and gb_terdekat[1] >= Y_ROI) else None
     rb_terdekat = rb_terdekat if (rb_terdekat is not None and rb_terdekat[1] >= Y_ROI) else None
     bb_terdekat = bb_terdekat if (bb_terdekat is not None and bb_terdekat[1] >= Y_ROI) else None
     
-    
     titik_tengah = None  # Initialize
     
-    # Case 1: 3 bola terdeteksi
+    # Case 1: 3 balls detected
     if gb_terdekat is not None and rb_terdekat is not None and bb_terdekat is not None:
         titik_tengah = utils_avoid.titik_tengah_3_bola(gb_terdekat, rb_terdekat, bb_terdekat)
         vel_belok = utils_avoid.cari_kecepatan_sudut(GAIN_YAW, titik_tengah, W)
         manda.set_velocity(vel_forward, vel_belok)
     
-    # Case 2: GREEN + RED saja
+    # Case 2: GREEN + RED only
     elif gb_terdekat is not None and rb_terdekat is not None and bb_terdekat is None:
         titik_tengah = utils_avoid.titik_tengah_2_bola(gb_terdekat, rb_terdekat)
         vel_belok = utils_avoid.cari_kecepatan_sudut(GAIN_YAW, titik_tengah, W)
@@ -287,41 +312,41 @@ def _avoid_start_step(img, manda, W, H, boxes, confs, clss, name2id, utils_avoid
             vel_belok = utils_avoid.cari_kecepatan_sudut(GAIN_YAW, titik_tengah, W)
             manda.set_velocity(vel_forward, vel_belok)
     
-    # Case 5: Hanya GREEN
+    # Case 5: Only GREEN
     elif gb_terdekat is not None and rb_terdekat is None and bb_terdekat is None:
         titik_tengah = utils_avoid.titik_tengah_1_bola(gb_terdekat, W, H, Y_ROI, reverse=True)
         if titik_tengah is not None:
             vel_belok = utils_avoid.cari_kecepatan_sudut(GAIN_YAW, titik_tengah, W)
             manda.set_velocity(vel_forward, vel_belok)
     
-    # Case 6: Hanya RED
+    # Case 6: Only RED
     elif rb_terdekat is not None and gb_terdekat is None and bb_terdekat is None:
         titik_tengah = utils_avoid.titik_tengah_1_bola(rb_terdekat, W, H, Y_ROI, reverse=False)
         if titik_tengah is not None:
             vel_belok = utils_avoid.cari_kecepatan_sudut(GAIN_YAW, titik_tengah, W)
             manda.set_velocity(vel_forward, vel_belok)
     
-    # Case 7: Hanya BLACK atau tidak ada bola
+    # Case 7: Only BLACK or no balls
     else:
-        # Tidak lihat bola, gerak ke WP kalau ada
+        # No balls visible, move to WP if available
         if (getattr(manda, 'target_lat', None) is not None) and (getattr(manda, 'target_lon', None) is not None):
             manda.move(manda.target_lat, manda.target_lon)
     
-    # Draw titik tengah jika ada
+    # Draw target point if exists
     if titik_tengah is not None:
-        # Cast to int tuple for cv2.circle
         titik_tengah_int = (int(titik_tengah[0]), int(titik_tengah[1]))
         cv2.circle(img, titik_tengah_int, 5, (255, 0, 255), -1)
 
-            
     steering = None
     return steering, vel_forward, "START"
 
 def _avoid_end_step(manda, W, H, boxes, confs, clss, name2id, utils_avoid, progress, idx, lat, lon, C=0):
     """
-    Fase END
+    END phase navigation
+    
+    Add END_RANGE += len(list_wp_muter) AFTER waypoint insertion
     """
-    global END_RANGE
+    global END_RANGE  # Need to modify global END_RANGE
     vel_forward = SPEED_MISI
 
     id_gl = name2id.get("greenlight")
@@ -332,11 +357,9 @@ def _avoid_end_step(manda, W, H, boxes, confs, clss, name2id, utils_avoid, progr
     p_x = getattr(manda, 'p_x', None)
     p_y = getattr(manda, 'p_y', None)
     
-    # Parameter trapesium ROI sama kaki
-    # top_half_width: setengah lebar di atas (y = H/2)
-    # bottom_half_width: setengah lebar di bawah (y = H)
-    trap_top_half = 80      # lebar atas = 80 pixel total
-    trap_bottom_half = W // 2  # lebar bawah = full width
+    # Trapezoid ROI parameters
+    trap_top_half = TRAP_TOP_HALF_WIDTH
+    trap_bottom_half = int(TRAP_BOTTOM_HALF_RATIO * W)
 
     gl_terdekat, rl_terdekat, bb_terdekat = None, None, None
     list_bb = []
@@ -354,7 +377,6 @@ def _avoid_end_step(manda, W, H, boxes, confs, clss, name2id, utils_avoid, progr
     rl_terdekat = utils_avoid.cari_titik_tengah_bbox(rl_terdekat)
     bb_terdekat = utils_avoid.cari_titik_tengah_bbox(bb_terdekat)
 
-
     steering = None
 
     if (gl_terdekat is not None) and (progress is not None) and (not progress.get("gl_done", False)):
@@ -363,36 +385,32 @@ def _avoid_end_step(manda, W, H, boxes, confs, clss, name2id, utils_avoid, progr
         manda.set_velocity(vel_forward, vel_belok)
         steering = vel_belok
         time.sleep(1)
-        # Cek apakah greenlight berada di dalam ROI trapesium
+        
+        # Check if greenlight is inside trapezoid ROI
         if _point_in_trapezoid(gl_terdekat[0], gl_terdekat[1], W, H, trap_top_half, trap_bottom_half):
             pos_lampu = utils_avoid.hitung_posisi_lampu((p_x, p_y, yaw), JARAK_LAMPU=5)
-            print(f"Posisi_Lampu = {pos_lampu}")
+            rospy.loginfo_throttle(5.0, f"Green light detected, lamp position = {pos_lampu}")
+            
             list_wp_muter = utils_avoid.buat_wp_mengitari_lampu(
                 pos_lampu, JUMLAH_TITIK=3,
                 origin=(manda.home_lat, manda.home_lon),
                 RADIUS=2
             )
-            print("Pengondisian Ijo. Please Wait..")
-            i = 0
             
-            for wp_lat, wp_lon in list_wp_muter:
+            rospy.loginfo("Inserting green light circle waypoints...")
+            
+            # Increment AFTER logging, not before
+            for i, (wp_lat, wp_lon) in enumerate(list_wp_muter):
                 lat.insert(idx + i, wp_lat)
                 lon.insert(idx + i, wp_lon)
-                i+=1
             
-            print("Udah selesai.. Nambah WP")
+            # Update END_RANGE AFTER dynamic waypoint insertion
             END_RANGE += len(list_wp_muter)
+            
+            rospy.loginfo(f"Added {len(list_wp_muter)} waypoints, END_RANGE now = {END_RANGE}")
             time.sleep(3)
-            '''
-            print(f"Sekarang Koordinat sebanyak {len(lat)}")
-            print(f"Update back wp dan end_wp. Please wait...")
-            wp_mission["end_wp"] += 3
-            wp_mission.update({"back_wp":(len(lat)-1)})
-            '''
             
             progress["gl_done"] = True
-            print(f"gl_done = {True} dan wp_mission up to date")
-            
 
     elif (rl_terdekat is not None) and (progress is not None) and (not progress.get("rl_done", False)):
         error_x_normalized = (rl_terdekat[0] - (W // 2)) / (W // 2)
@@ -400,7 +418,7 @@ def _avoid_end_step(manda, W, H, boxes, confs, clss, name2id, utils_avoid, progr
         manda.set_velocity(vel_forward, vel_belok)
         steering = vel_belok
 
-        # Cek apakah redlight berada di dalam ROI trapesium
+        # Check if redlight is inside trapezoid ROI
         if _point_in_trapezoid(rl_terdekat[0], rl_terdekat[1], W, H, trap_top_half, trap_bottom_half):
             utils_avoid.posisi_lampu_merah(
                 (p_x, p_y, yaw),
@@ -408,7 +426,7 @@ def _avoid_end_step(manda, W, H, boxes, confs, clss, name2id, utils_avoid, progr
                 origin=(manda.home_lat, manda.home_lon)
             )
             
-            print("Pengondisian Merah. Please Wait..")
+            rospy.loginfo("Red light condition triggered")
             progress["rl_done"] = True
 
     elif bb_terdekat is not None:
@@ -424,9 +442,8 @@ def _avoid_end_step(manda, W, H, boxes, confs, clss, name2id, utils_avoid, progr
 
 def _avoid_back_step(img, manda, W, H, boxes, confs, clss, name2id, utils_avoid, progress, GAIN_YAW, Y_ROI):
     """
-    Fase BACK
+    BACK phase navigation
     """
-
     vel_forward = SPEED_MISI
     
     id_gb = name2id.get("greenball")
@@ -446,32 +463,29 @@ def _avoid_back_step(img, manda, W, H, boxes, confs, clss, name2id, utils_avoid,
     rb_terdekat = utils_avoid.pilih_bola_terdekat(list_rb)
     bb_terdekat = utils_avoid.pilih_bola_terdekat(list_bb)
 
-    # Convert ke titik tengah bbox dulu
+    # Convert to bbox center
     gb_terdekat = utils_avoid.cari_titik_tengah_bbox(gb_terdekat)
     rb_terdekat = utils_avoid.cari_titik_tengah_bbox(rb_terdekat)
     bb_terdekat = utils_avoid.cari_titik_tengah_bbox(bb_terdekat)
     
-    # Filter berdasarkan Y_ROI (hanya jika tidak None dan y > Y_ROI)
+    # Filter based on Y_ROI
     gb_terdekat = gb_terdekat if (gb_terdekat is not None and gb_terdekat[1] >= Y_ROI) else None
     rb_terdekat = rb_terdekat if (rb_terdekat is not None and rb_terdekat[1] >= Y_ROI) else None
     bb_terdekat = bb_terdekat if (bb_terdekat is not None and bb_terdekat[1] >= Y_ROI) else None
     
+    titik_tengah = None
     
-    titik_tengah = None  # Initialize
-    
-    # Case 1: 3 bola terdeteksio
+    # Same logic as START but with reverse directions
     if gb_terdekat is not None and rb_terdekat is not None and bb_terdekat is not None:
         titik_tengah = utils_avoid.titik_tengah_3_bola(gb_terdekat, rb_terdekat, bb_terdekat)
         vel_belok = utils_avoid.cari_kecepatan_sudut(GAIN_YAW, titik_tengah, W)
         manda.set_velocity(vel_forward, vel_belok)
     
-    # Case 2: GREEN + RED saja
     elif gb_terdekat is not None and rb_terdekat is not None and bb_terdekat is None:
         titik_tengah = utils_avoid.titik_tengah_2_bola(gb_terdekat, rb_terdekat)
         vel_belok = utils_avoid.cari_kecepatan_sudut(GAIN_YAW, titik_tengah, W)
         manda.set_velocity(vel_forward, vel_belok)
     
-    # Case 3: GREEN + BLACK
     elif gb_terdekat is not None and bb_terdekat is not None and rb_terdekat is None:
         titik_gb = utils_avoid.titik_tengah_1_bola(gb_terdekat, W, H, Y_ROI, reverse=False)
         if titik_gb is not None:
@@ -481,7 +495,6 @@ def _avoid_back_step(img, manda, W, H, boxes, confs, clss, name2id, utils_avoid,
             vel_belok = utils_avoid.cari_kecepatan_sudut(GAIN_YAW, titik_tengah, W)
             manda.set_velocity(vel_forward, vel_belok)
     
-    # Case 4: RED + BLACK
     elif rb_terdekat is not None and bb_terdekat is not None and gb_terdekat is None:
         titik_rb = utils_avoid.titik_tengah_1_bola(rb_terdekat, W, H, Y_ROI, reverse=True)
         if titik_rb is not None:
@@ -491,47 +504,47 @@ def _avoid_back_step(img, manda, W, H, boxes, confs, clss, name2id, utils_avoid,
             vel_belok = utils_avoid.cari_kecepatan_sudut(GAIN_YAW, titik_tengah, W)
             manda.set_velocity(vel_forward, vel_belok)
     
-    # Case 5: Hanya GREEN
     elif gb_terdekat is not None and rb_terdekat is None and bb_terdekat is None:
         titik_tengah = utils_avoid.titik_tengah_1_bola(gb_terdekat, W, H, Y_ROI, reverse=False)
         if titik_tengah is not None:
             vel_belok = utils_avoid.cari_kecepatan_sudut(GAIN_YAW, titik_tengah, W)
             manda.set_velocity(vel_forward, vel_belok)
     
-    # Case 6: Hanya RED
     elif rb_terdekat is not None and gb_terdekat is None and bb_terdekat is None:
         titik_tengah = utils_avoid.titik_tengah_1_bola(rb_terdekat, W, H, Y_ROI, reverse=True)
         if titik_tengah is not None:
             vel_belok = utils_avoid.cari_kecepatan_sudut(GAIN_YAW, titik_tengah, W)
             manda.set_velocity(vel_forward, vel_belok)
     
-    # Case 7: Hanya BLACK atau tidak ada bola
     else:
-        # Tidak lihat bola, gerak ke WP kalau ada
         if (getattr(manda, 'target_lat', None) is not None) and (getattr(manda, 'target_lon', None) is not None):
             manda.move(manda.target_lat, manda.target_lon)
     
-    # Draw titik tengah jika ada
+    # Draw target point
     if titik_tengah is not None:
-        # Cast to int tuple for cv2.circle
         titik_tengah_int = (int(titik_tengah[0]), int(titik_tengah[1]))
         cv2.circle(img, titik_tengah_int, 5, (255, 0, 255), -1)
     
     steering_start = None
-    # Kalau END tidak ada steering, pakai hasil BACK start
     return steering_start, vel_forward, "BACK"
+
+
+# MAIN DETECTION LOOP
 
 def _loop_and_detect(manda, cam, trt_yolo, conf_th, vis, lat, lon, idx,
                      tracker=None, classes_to_track=None,
                      cls_dict=None, allow_start_ids=None, allow_end_ids=None,
                      end_wp=-1, per_cls_thresh=None, back_mode=False):
-
+    """
+    Main detection and navigation loop
+    
+    Calculate LIMIT_START/END/BACK BEFORE loop (not inside)
+    """
     full_scrn = False
     fps = 0.0
     tic = time.time()
     wp_status = "INIT"
     last_wp_reached = -1
-
 
     H = getattr(cam, "img_height", None)
     W = getattr(cam, "img_width", None)
@@ -540,11 +553,9 @@ def _loop_and_detect(manda, cam, trt_yolo, conf_th, vis, lat, lon, idx,
     if W is not None:
         W = int(W)
 
-    idx=0
+    idx = 0
     
-    # sinkronisasi awal idx / current_wp_index / target supaya consistent ---
-
-    # Pastikan manda.target_lat/target_lon dan current_wp_index konsisten
+    # Sync manda state
     try:
         if 0 <= idx < len(lat):
             manda.target_lat = lat[idx]
@@ -560,26 +571,30 @@ def _loop_and_detect(manda, cam, trt_yolo, conf_th, vis, lat, lon, idx,
 
     utils_avoid = UTILS_MISI_AVOID()
   
-    Y_ROI = 240
-    KONSTANTA_BOLA = 100
+    # Calculate ROI parameters based on frame size
+    Y_ROI, KONSTANTA_BOLA = get_roi_params(H, W)
     
     GAIN_YAW = {
-        "LEFT":2.5,
-        "RIGHT":2.0
-        }
+        "LEFT": 2.5,
+        "RIGHT": 2.0
+    }
     
     red = (0, 0, 255)
     green = (0, 255, 0)
-    # Statistik tracking
-    seen_ids  = [set() for _ in range(num_classes)]
-    cum_counts= [0 for _ in range(num_classes)]
+    
+    # Tracking statistics
+    seen_ids = [set() for _ in range(num_classes)]
+    cum_counts = [0 for _ in range(num_classes)]
 
     end_progress = {"gl_done": False, "rl_done": False, "announced_back": False}
  
     back_phase = bool(back_mode)
     last_phase = None
-    #wp_mission = {"start_wp":1, "end_wp":3, "back_wp":6}
     
+    # Calculate phase limits BEFORE loop, not inside
+    LIMIT_START = START_RANGE
+    LIMIT_END = LIMIT_START + END_RANGE
+    LIMIT_BACK = LIMIT_END + BACK_RANGE
     
     while not rospy.is_shutdown():
         try:
@@ -594,19 +609,17 @@ def _loop_and_detect(manda, cam, trt_yolo, conf_th, vis, lat, lon, idx,
 
         if W is None or H is None:
             H, W = img.shape[:2]
-            H, W = int(H), int(W)  # Pastikan integer
+            H, W = int(H), int(W)
+            # Recalculate ROI params if dimensions changed
+            Y_ROI, KONSTANTA_BOLA = get_roi_params(H, W)
 
-        # Parameter trapesium ROI (sama dengan di _avoid_end_step)
-        trap_top_half = 100
-        trap_bottom_half = W // 2
-            
-        #Phase Limit    
-        LIMIT_START = START_RANGE
-        LIMIT_END = LIMIT_START + END_RANGE
-        LIMIT_BACK = LIMIT_END + BACK_RANGE
+        # Trapezoid parameters
+        trap_top_half = TRAP_TOP_HALF_WIDTH
+        trap_bottom_half = int(TRAP_BOTTOM_HALF_RATIO * W)
         
+        # Phase limits are calculated BEFORE loop
         
-        # Deteksi
+        # Detection
         try:
             res = trt_yolo.detect(img, conf_th)
         except Exception as e:
@@ -622,13 +635,11 @@ def _loop_and_detect(manda, cam, trt_yolo, conf_th, vis, lat, lon, idx,
             except Exception:
                 boxes, confs, clss = [], [], []
 
-
-        # Tentukan WP saat ini dan fase
+        # Determine current phase
         cur_wp = int(getattr(manda, 'current_wp_index'))
         forced_end = bool(getattr(manda, 'end_phase', False))
-        print(f"idx = {idx}")
         
-        
+        # Use pre-calculated limits
         if idx < LIMIT_START:
             phase = "START"
         elif idx < LIMIT_END:
@@ -638,30 +649,28 @@ def _loop_and_detect(manda, cam, trt_yolo, conf_th, vis, lat, lon, idx,
         else:
             phase = "DONE"
         
-        print(f"Phase = {phase}")
-
+        rospy.logdebug_throttle(2.0, f"[AVOID] idx={idx}, phase={phase}, limits: START={LIMIT_START}, END={LIMIT_END}, BACK={LIMIT_BACK}")
                 
         if phase != last_phase:
-            rospy.loginfo(f"[AVOID] Phase -> {phase}")
-            print("[AVOID] Phase ->", phase)
+            rospy.loginfo(f"[AVOID] Phase transition -> {phase}")
             last_phase = phase
 
-        # Filter kelas sesuai fase
+        # Filter classes by phase
         if phase == "START":
             allowed_ids = allow_start_ids
         elif phase == "END":
             allowed_ids = allow_end_ids
-        else:  # BACK: bebas
+        else:  # BACK: no filtering
             allowed_ids = None
 
         boxes, confs, clss = _filter_by_allowed(
             boxes, confs, clss, conf_th, per_cls_thresh, allowed_ids
         )
 
-        # Hitungan per-frame untuk tracker
+        # Per-frame counts for tracking
         frame_counts = [0 for _ in range(num_classes)]
 
-        # Tracker
+        # Tracking
         if tracker is not None:
             dets = []
             for (box, sc, c) in zip(boxes, confs, clss):
@@ -677,7 +686,8 @@ def _loop_and_detect(manda, cam, trt_yolo, conf_th, vis, lat, lon, idx,
                     if tid not in seen_ids[c]:
                         seen_ids[c].add(tid)
                         cum_counts[c] += 1
-        # Pilih perilaku berdasarkan fase
+        
+        # Execute phase behavior
         if phase == "START":
             steering, vel_forward, note = _avoid_start_step(
                 img, manda, W, H, boxes, confs, clss,
@@ -696,13 +706,12 @@ def _loop_and_detect(manda, cam, trt_yolo, conf_th, vis, lat, lon, idx,
                 img, manda, W, H, boxes, confs, clss,
                 name2id, utils_avoid, end_progress, GAIN_YAW, Y_ROI
             )
-            phase = note  # supaya HUD bisa tampil "BACK" / "BACK(END)"
+            phase = note
 
-        # Kalau sudah sampai target final (block-style)
-        print(f"Banyak WP : {len(lat)}")
-        if manda.has_reached_final() and idx >= (len(lat)-1):
+        # Check mission completion
+        if manda.has_reached_final() and idx >= (len(lat) - 1):
             frame_dict = {names[i]: frame_counts[i] for i in range(num_classes)}
-            cum_dict   = {names[i]: cum_counts[i]   for i in range(num_classes)}
+            cum_dict = {names[i]: cum_counts[i] for i in range(num_classes)}
             try:
                 manda.report(
                     task="avoid",
@@ -715,12 +724,12 @@ def _loop_and_detect(manda, cam, trt_yolo, conf_th, vis, lat, lon, idx,
                         "status": "done"
                     },
                     throttle_key="avoid_done"
-            )
-
+                )
             except Exception:
                 pass
             return True
                
+        # Waypoint reached check
         if manda.has_reached_target():
             last_wp_reached = idx
             wp_status = f"WP {idx + 1} REACHED"
@@ -734,7 +743,6 @@ def _loop_and_detect(manda, cam, trt_yolo, conf_th, vis, lat, lon, idx,
             if idx < len(lat):
                 manda.target_lat = lat[idx]
                 manda.target_lon = lon[idx]
-                #manda.current_wp_index = idx  #gara gara ini jadi ngeloop
 
                 rospy.loginfo(
                     "[AVOID] Moving to WP %d | lat=%.7f lon=%.7f",
@@ -743,7 +751,7 @@ def _loop_and_detect(manda, cam, trt_yolo, conf_th, vis, lat, lon, idx,
             else:
                 wp_status = "FINAL WP REACHED"
 
-        # Gambar bbox deteksi
+        # Draw bboxes
         img = vis.draw_bboxes(img, boxes, confs, clss)
 
         # FPS
@@ -766,11 +774,13 @@ def _loop_and_detect(manda, cam, trt_yolo, conf_th, vis, lat, lon, idx,
         ]
 
         draw_hud(img, hud)
-        # Gambar ROI trapesium sama kaki
+        
+        # Draw trapezoid ROI
         _draw_trapezoid_roi(img, W, H, trap_top_half, trap_bottom_half, green, 2)
-        y_mid = (H // 2 + H) // 2  # tengah trapesium
+        y_mid = (H // 2 + H) // 2
         cv2.line(img, (0, Y_ROI), (W, Y_ROI), red, 1, cv2.LINE_AA)
 
+        # Report status
         cum_dict = {names[i]: cum_counts[i] for i in range(num_classes)}
         try:
             manda.report(
@@ -788,21 +798,23 @@ def _loop_and_detect(manda, cam, trt_yolo, conf_th, vis, lat, lon, idx,
         elif k in (ord('f'), ord('F')):
             full_scrn = not full_scrn
             set_display(WINDOW_NAME, full_scrn)
+    
     return True
 
 
 def run(manda, lat, lon, args, cam, trt=None):
+    """Entry point for avoid mission"""
     cls_dict = get_cls_dict_by_model(args.avoid_model, override_num=args.avoid_category_num)
     color_map = get_color_map_by_model(args.avoid_model)
     vis = BBoxVisualization(cls_dict, color_map=color_map)
-    print("ASFG")
+    
     if trt is None:
         engine_path = os.path.join(args.avoid_engine_dir, f'{args.avoid_model}.trt')
         if not os.path.isfile(engine_path):
             raise SystemExit(f'ERROR: TRT engine not found: {engine_path}')
         trt = TrtYOLO(args.avoid_model, len(cls_dict), args.avoid_letter_box)
 
-        # warmup sekali (aman kalau gagal)
+        # Warmup
         try:
             h = int(getattr(cam, "img_height", 360))
             w = int(getattr(cam, "img_width", 640))
@@ -811,28 +823,29 @@ def run(manda, lat, lon, args, cam, trt=None):
         except Exception:
             pass
 
-    # tracker
+    # Tracker setup
     classes_to_track = _parse_track_classes(args.avoid_track_classes, len(cls_dict))
     tracker = None if args.avoid_tracker == 'none' else _attach_tracker(args.avoid_tracker, classes_to_track, args)
 
-    # window
+    # Window setup
     try:
         if cv2.getWindowProperty(WINDOW_NAME, 0) < 0:
             open_window(WINDOW_NAME, 'Mission: AVOID', cam.img_width, cam.img_height)
     except Exception:
         open_window(WINDOW_NAME, 'Mission: AVOID', cam.img_width, cam.img_height)
 
-    # parse allow lists and per-class thresholds
+    # Parse allow lists and per-class thresholds
     allow_start_ids = _names_to_ids(args.avoid_allow_start, cls_dict)
-    allow_end_ids   = _names_to_ids(args.avoid_allow_end,   cls_dict)
-    per_cls_thresh  = _parse_class_thresh(args.avoid_class_thrash, cls_dict) if hasattr(args, "avoid_class_thrash") else _parse_class_thresh(args.avoid_class_thresh, cls_dict)
+    allow_end_ids = _names_to_ids(args.avoid_allow_end, cls_dict)
+    per_cls_thresh = _parse_class_thresh(args.avoid_class_thresh, cls_dict)
 
     try:
-        # set final target on manda and call loop (pass lat/lon for block-style)
+        # Set final target
         manda.final_lat, manda.final_lon = float(lat[-1]), float(lon[-1])
+        
         ok = _loop_and_detect(
             manda, cam, trt, args.avoid_conf_thresh, vis,
-            lat, lon, 0,  # positional args: lat, lon, idx
+            lat, lon, 0,
             tracker=tracker, classes_to_track=classes_to_track,
             cls_dict=cls_dict,
             allow_start_ids=allow_start_ids, allow_end_ids=allow_end_ids,
