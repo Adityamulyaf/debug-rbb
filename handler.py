@@ -1,640 +1,437 @@
 #!/usr/bin/env python3
-# handler_ros1.py
 
-'''
-Fitur:
-- Waypoint pull (Mission Planner) -- latitude_array, longitude_array
-- Gerak ke GPS target (GlobalPositionTarget)
-- Velocity command (TwistStamped) -- axis maju bisa x atau y (param ~forward_axis)
-- Kunci heading (AttitudeTarget, yaw saja)
-- Heading kompas, pose lokal (roll/pitch/yaw dari quaternion)
-- Param get/set (MAVROS), set_mode, arm/disarm
-- Ubah speed (MAV_CMD_DO_CHANGE_SPEED / 178)
-- Servo (183), Relay (181)
-- LiDAR opsional (/scan)
-- v4l2 helpers (opsional)
-
-ROS params:
-~allow_arm        (bool,  default: False) -- boleh arm FCU
-~dry_run          (bool,  default: True)  -- log-only, tidak publish/serve FCU
-~dist_thr_m       (float, default: 2.0)   -- ambang waypoint tercapai (meter)
-~forward_axis     (str,   default: "y")   -- "x" untuk linear.x maju, "y" untuk linear.y
-
-Tambahan:
-~report_enable            (bool,  default: False) -- publish JSON ringkas status/misi
-~report_topic             (str,   default: "/asv/report")
-~report_interval          (float, default: 1.0)  -- throttle report per-key (detik)
-~set_speed_log_interval   (float, default: 2.0)  -- throttle log SetSpeed (detik)
-~set_speed_log_delta      (float, default: 0.2)  -- minimal perubahan nilai utk log (m/s)
-~perf_monitor_enable      (bool,  default: False)
-~perf_monitor_interval    (float, default: 10.0) -- interval log perf (detik)
-'''
-
-import math
-import shutil
-import subprocess
-from typing import Optional, List, Tuple
+"""
+MandaHandler - RoboBoat 2026 Mandakini X Handler
+Manages waypoint navigation, reporting, and vehicle control
+"""
 
 import rospy
+import math
+import threading
+from std_msgs.msg import String, Float32
+from sensor_msgs.msg import NavSatFix
+from geometry_msgs.msg import Twist
+from mavros_msgs.msg import State, WaypointReached
+from mavros_msgs.srv import CommandBool, SetMode, CommandTOL
 
+# Import RoboCommand reporter
 try:
-    from tf import transformations as tft
-except Exception:
-    tft = None
-
-import os
-import json
-import time
-
-from geographiclib.geodesic import Geodesic
-
-from std_msgs.msg import Header, Float64
-from sensor_msgs.msg import NavSatFix, LaserScan
-from geometry_msgs.msg import TwistStamped, PoseStamped, Quaternion
-from mavros_msgs.msg import (
-    GlobalPositionTarget, WaypointList, State, AttitudeTarget, ParamValue, HomePosition
-)
-from mavros_msgs.srv import (
-    CommandBool, SetMode, ParamSet, ParamGet, WaypointPull, WaypointPush, WaypointPushRequest, CommandLong
-)
-
-from std_msgs.msg import String
+    from New.report_test import (
+        RoboCommandReporter, TaskType, RobotState,
+        GateType, ObjectType, Color
+    )
+    REPORTER_AVAILABLE = True
+except ImportError:
+    REPORTER_AVAILABLE = False
+    print("[HANDLER] WARNING: roboboat_reporter not available")
 
 
-class MandaHandler(object):
-    def __init__(self) -> None:
-        # Params
-        self.allow_arm: bool = rospy.get_param("~allow_arm", True)
-        self.dry_run: bool = rospy.get_param("~dry_run", False)
+# CONSTANTS (Top of file for easy tuning)
 
-        self.dist_thr_m: float = rospy.get_param("~dist_thr_m",
-                                 rospy.get_param("~distance_threshold_m", 2.0))
+# Navigation thresholds
+DEFAULT_DIST_THRESHOLD_M = 2.0 # Default waypoint reached distance
+DEFAULT_SPEED_M_S = 1.5 # Default cruising speed
 
-        # Arah sumbu maju untuk geometry_msgs/Twist (x atau y)
-        self.forward_axis: str = rospy.get_param("~forward_axis", "y").lower()
-        if self.forward_axis not in ("x", "y"):
-            rospy.logwarn("Param ~forward_axis tidak valid: %s (pakai 'y')", self.forward_axis)
-            self.forward_axis = "y"
+# Reporting configuration
+TEAM_ID = "BUV-UNS"
+VEHICLE_ID = "S1"
 
-        # State
-        self.armed: bool = False
+# Throttle intervals (seconds)
+REPORT_THROTTLE_INTERVAL = 0.5
 
-        # GPS
-        self.current_lat: Optional[float] = None
-        self.current_lon: Optional[float] = None
-        self.target_lat: Optional[float] = None
-        self.target_lon: Optional[float] = None
-        self.final_lat: Optional[float] = None
-        self.final_lon: Optional[float] = None
-        self.current_wp_index: Optional[int] = None
-        self.latitude_array: List[float] = []
-        self.longitude_array: List[float] = []
-        self.home_lat: Optional[float] = None
-        self.home_lon: Optional[float] = None
 
-        #Position in local frame
-        self.p_x: float = 0.0
-        self.p_y: float = 0.0
-        self.p_z: float = 0.0
+# MANDA HANDLER CLASS
 
-        # Attitude/heading
-        self.current_heading_deg: float = 0.0
-        self.current_roll: float = 0.0
-        self.current_pitch: float = 0.0
-        self.current_yaw: float = 0.0  # rad
+class MandaHandler:
+    """
+    Main handler for Mandakini X
+    Manages navigation, reporting, and mission coordination
+    """
+    
+    def __init__(self):
+        """Initialize handler"""
+        rospy.loginfo("[HANDLER] Initializing MandaHandler...")
 
-        # LiDAR
-        self.front_distance: float = 12.0
-        self.left_distance: float = 12.0
-        self.right_distance: float = 12.0
+        # State Variables
+        self.latitude = 0.0
+        self.longitude = 0.0
+        self.altitude = 0.0
+        self.heading = 0.0 # Degrees (North=0, East=90)
+        self.speed = 0.0 # m/s
+        
+        self.target_lat = None
+        self.target_lon = None
+        
+        # Mission planner waypoints (loaded from mission file)
+        self.latitude_array = []
+        self.longitude_array = []
+        self.current_wp_index = 0
+        
+        # Distance threshold for waypoint reached
+        self.dist_thr_m = DEFAULT_DIST_THRESHOLD_M
 
-        # Services
-        self._init_services()
+        # Threading Locks
+        self._gps_lock = threading.Lock()
+        self._speed_lock = threading.Lock()
+        self._report_lock = threading.Lock()
 
-        # Publishers
-        self.pub_global = rospy.Publisher('/mavros/setpoint_raw/global', GlobalPositionTarget, queue_size=10)
-        self.pub_att    = rospy.Publisher('/mavros/setpoint_raw/attitude', AttitudeTarget, queue_size=10)
-        self.pub_vel    = rospy.Publisher('/mavros/setpoint_velocity/cmd_vel', TwistStamped, queue_size=10)
+        # ROS Subscribers
+        self.gps_sub = rospy.Subscriber(
+            '/mavros/global_position/global',
+            NavSatFix,
+            self._gps_callback,
+            queue_size=1
+        )
+        
+        self.heading_sub = rospy.Subscriber(
+            '/mavros/global_position/compass_hdg',
+            Float32,
+            self._heading_callback,
+            queue_size=1
+        )
+        
+        self.state_sub = rospy.Subscriber(
+            '/mavros/state',
+            State,
+            self._state_callback,
+            queue_size=1
+        )
 
-        # Subscribers
-        rospy.Subscriber('/mavros/global_position/global', NavSatFix, self._cb_gps, queue_size=10)
-        rospy.Subscriber('/mavros/mission/waypoints', WaypointList, self._cb_wps, queue_size=10)
-        rospy.Subscriber('/mavros/state', State, self._cb_state, queue_size=10)
-        rospy.Subscriber('/mavros/global_position/compass_hdg', Float64, self._cb_compass, queue_size=10)
-        rospy.Subscriber('/mavros/local_position/pose', PoseStamped, self._cb_pose_local, queue_size=2)
-        rospy.Subscriber('/mavros/home_position/home', HomePosition, self._cb_home, queue_size=10)
+        # ROS Publishers
+        self.cmd_vel_pub = rospy.Publisher(
+            '/mavros/setpoint_velocity/cmd_vel_unstamped',
+            Twist,
+            queue_size=1
+        )
 
-        # LiDAR
-        try:
-            rospy.Subscriber('/scan', LaserScan, self._cb_lidar, queue_size=10)
-        except Exception:
-            pass
-
-        # Reporting global
-        self.report_enable: bool = rospy.get_param("~report_enable", True)
-        self.report_topic: str = rospy.get_param("~report_topic", "/asv/report")
-        self.report_interval: float = float(rospy.get_param("~report_interval", 1.0))
-        self._report_pub = None
-        self._report_last_ts = {}
-
-        if self.report_enable:
-            self._report_pub = rospy.Publisher(self.report_topic, String, queue_size=10)
-            rospy.on_shutdown(self._report_close)
-
-        # Throttle untuk log SetSpeed
-        self._set_speed_log_itvl = float(rospy.get_param("~set_speed_log_interval", 2.0))
-        self._set_speed_log_delta = float(rospy.get_param("~set_speed_log_delta", 0.2))
-        self._spd_last_log_t = 0.0
-        self._spd_last_val = None
-        self._spd_last_success = None
-
-        # Perf monitor ringan (publish rate)
-        self._perf_enable = bool(rospy.get_param("~perf_monitor_enable", False))
-        self._perf_itvl = float(rospy.get_param("~perf_monitor_interval", 10.0))
-        self._ctr_vel_pubs = 0
-        self._ctr_global_pubs = 0
-        self._ctr_set_speed_calls = 0
-        self._perf_last_t = time.time()
-        if self._perf_enable:
-            self._perf_timer = rospy.Timer(rospy.Duration(self._perf_itvl), self._perf_tick)
-
-        rospy.loginfo("MandaHandler (ROS1) ready. dry_run=%s allow_arm=%s forward_axis=%s dist_thr_m=%.2f",
-                      self.dry_run, self.allow_arm, self.forward_axis, self.dist_thr_m)
-
-    # Init Services
-    def _init_services(self) -> None:
-        rospy.loginfo("Waiting MAVROS services ...")
+        # ROS Services
         rospy.wait_for_service('/mavros/cmd/arming')
         rospy.wait_for_service('/mavros/set_mode')
-        rospy.wait_for_service('/mavros/param/set')
-        rospy.wait_for_service('/mavros/param/get')
-        rospy.wait_for_service('/mavros/mission/pull')
-        rospy.wait_for_service('/mavros/mission/push')
-        rospy.wait_for_service('/mavros/cmd/command')
+        
+        self.arming_client = rospy.ServiceProxy('/mavros/cmd/arming', CommandBool)
+        self.set_mode_client = rospy.ServiceProxy('/mavros/set_mode', SetMode)
+        
 
-        self.srv_arm       = rospy.ServiceProxy('/mavros/cmd/arming', CommandBool)
-        self.srv_mode      = rospy.ServiceProxy('/mavros/set_mode', SetMode)
-        self.srv_param_set = rospy.ServiceProxy('/mavros/param/set', ParamSet)
-        self.srv_param_get = rospy.ServiceProxy('/mavros/param/get', ParamGet)
-
-        self.srv_wp_pull   = rospy.ServiceProxy('/mavros/mission/pull', WaypointPull, persistent=True)
-        self.srv_wp_push   = rospy.ServiceProxy('/mavros/mission/push', WaypointPush)
-        self.srv_cmd_long  = rospy.ServiceProxy('/mavros/cmd/command', CommandLong)
-        rospy.loginfo("All MAVROS services available.")
-
-    # Movement primitives
-    def move(self, lat: float, lon: float, alt: float = 0.0, speed: Optional[float] = None) -> None:
-        """Kirim setpoint global (lat/lon/alt)."""
-        self.target_lat = float(lat)
-        self.target_lon = float(lon)
-
-        if speed is not None:
-            self.set_speed(speed)
-
-        if self.dry_run:
-            rospy.loginfo("[DRY] move -- lat=%.7f lon=%.7f alt=%.1f", lat, lon, alt)
-            return
-
-        msg = GlobalPositionTarget()
-        msg.header = Header()
-        msg.header.stamp = rospy.Time.now()
-        msg.coordinate_frame = GlobalPositionTarget.FRAME_GLOBAL_REL_ALT
-        msg.type_mask = int(
-            GlobalPositionTarget.IGNORE_VX |
-            GlobalPositionTarget.IGNORE_VY |
-            GlobalPositionTarget.IGNORE_VZ |
-            GlobalPositionTarget.IGNORE_AFX |
-            GlobalPositionTarget.IGNORE_AFY |
-            GlobalPositionTarget.IGNORE_AFZ |
-            GlobalPositionTarget.IGNORE_YAW |
-            GlobalPositionTarget.IGNORE_YAW_RATE
-        )
-        msg.latitude  = self.target_lat
-        msg.longitude = self.target_lon
-        msg.altitude  = float(alt)
-        self.pub_global.publish(msg)
-        self._ctr_global_pubs += 1
-
-    def set_velocity(self, vel_fwd: float, yaw_rate: float) -> None:
-        """
-        Command velocity:
-          - vel_fwd -- maju (+) / mundur (-) pada axis yang dipilih (x/y)
-          - yaw_rate -- angular.z (rad/s)
-        """
-        if self.dry_run:
-            rospy.loginfo("[DRY] set_velocity fwd=%.2f wz=%.2f (axis=%s)", vel_fwd, yaw_rate, self.forward_axis)
-            return
-
-        msg = TwistStamped()
-        msg.header.stamp = rospy.Time.now()
-        if self.forward_axis == "x":
-            msg.twist.linear.x = float(vel_fwd)
+        # RoboCommand Reporter
+        self.report_enable = REPORTER_AVAILABLE
+        if self.report_enable:
+            self.reporter = RoboCommandReporter(
+                team_id=TEAM_ID,
+                vehicle_id=VEHICLE_ID,
+                enable=True
+            )
+            self.reporter.start_heartbeat(self)
+            rospy.loginfo("[HANDLER] RoboCommand reporter initialized")
         else:
-            msg.twist.linear.y = float(vel_fwd)
-        msg.twist.angular.z = float(yaw_rate)
-        self.pub_vel.publish(msg)
-        self._ctr_vel_pubs += 1
+            rospy.logwarn("[HANDLER] RoboCommand reporting DISABLED")
+        
 
-    def quaternion_from_yaw(self, yaw: float) -> Quaternion:
-        """yaw (rad) -- Quaternion (roll=0, pitch=0)."""
-        q = Quaternion()
-        q.x = 0.0
-        q.y = 0.0
-        q.z = math.sin(yaw / 2.0)
-        q.w = math.cos(yaw / 2.0)
-        return q
-
-    def set_heading(self, yaw_target_rad: float, thrust: float = 0.0) -> None:
-        """Kunci heading (yaw) via AttitudeTarget."""
-        if self.dry_run:
-            rospy.loginfo("[DRY] set_heading yaw=%.1f deg thrust=%.2f",
-                          math.degrees(yaw_target_rad), thrust)
-            return
-
-        msg = AttitudeTarget()
-        msg.header = Header()
-        msg.header.stamp = rospy.Time.now()
-
-        msg.orientation = self.quaternion_from_yaw(yaw_target_rad)
-        msg.thrust = float(thrust)
-        msg.type_mask = int(
-            AttitudeTarget.IGNORE_ROLL_RATE |
-            AttitudeTarget.IGNORE_PITCH_RATE |
-            AttitudeTarget.IGNORE_YAW_RATE
-        )
-        self.pub_att.publish(msg)
-
-    def check_heading(self, heading_target_deg: float, tol_deg: float = 10.0) -> bool:
-        cur = (self.current_heading_deg or 0.0) % 360.0
-        tgt = heading_target_deg % 360.0
-        err = (tgt - cur + 360.0) % 360.0
-        if err > 180.0:
-            err -= 360.0
-        return abs(err) <= tol_deg
+        # Mission-specific queues (with locks)
+        self.speed_route_queue = []
+        
+        # Report throttling
+        self._last_report_time = {}
+        
+        rospy.loginfo("[HANDLER] MandaHandler initialized successfully")
     
-    def has_reached_final(self) -> bool:
-        d = self.distance_to_final_m()
-        if d is None:
-            return False
-        return d < float(self.dist_thr_m)
-    
-    def distance_to_final_m(self) -> Optional[float]:
-        if self.current_lat is None or self.current_lon is None:
-            return None
-        if self.final_lat is None or self.final_lon is None:
-            return None
-        g = Geodesic.WGS84.Inverse(self.current_lat, self.current_lon,
-                                   self.final_lat, self.final_lon)
-        return float(g['s12'])
 
-    def has_reached_target(self) -> bool:
+    # ROS CALLBACKS
+    
+    def _gps_callback(self, msg):
+        """GPS position callback"""
+        with self._gps_lock:
+            self.latitude = msg.latitude
+            self.longitude = msg.longitude
+            self.altitude = msg.altitude
+    
+    def _heading_callback(self, msg):
+        """Compass heading callback"""
+        self.heading = msg.data
+    
+    def _state_callback(self, msg):
+        """Vehicle state callback"""
+        if self.report_enable:
+            # Update reporter state
+            if msg.armed:
+                self.reporter.set_state(RobotState.STATE_AUTO)
+            else:
+                self.reporter.set_state(RobotState.STATE_KILLED)
+
+    # NAVIGATION METHODS
+    
+    def distance_to_target_m(self):
+        """
+        Calculate distance to target in meters
+        
+        Returns:
+            float: Distance in meters, or None if no target set
+        """
+        if self.target_lat is None or self.target_lon is None:
+            return None
+        
+        with self._gps_lock:
+            lat1 = self.latitude
+            lon1 = self.longitude
+        
+        lat2 = self.target_lat
+        lon2 = self.target_lon
+        
+        # Haversine formula
+        R = 6371000  # Earth radius in meters
+        phi1 = math.radians(lat1)
+        phi2 = math.radians(lat2)
+        dphi = math.radians(lat2 - lat1)
+        dlambda = math.radians(lon2 - lon1)
+        
+        a = (math.sin(dphi / 2) ** 2 +
+             math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2)
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        
+        return R * c
+    
+    def has_reached_target(self, threshold_override=None):
+        """
+        Check if target waypoint reached
+        
+        Args:
+            threshold_override: Custom threshold in meters (optional)
+        
+        Returns:
+            bool: True if target reached
+        """
         d = self.distance_to_target_m()
         if d is None:
             return False
-        return d < float(self.dist_thr_m)
-
-    def distance_to_target_m(self) -> Optional[float]:
-        if self.current_lat is None or self.current_lon is None:
-            return None
+        
+        thr = threshold_override if threshold_override is not None else self.dist_thr_m
+        return d < float(thr)
+    
+    def bearing_to_target_deg(self):
+        """
+        Calculate bearing to target in degrees
+        
+        Returns:
+            float: Bearing in degrees (North=0, East=90), or None if no target
+        """
         if self.target_lat is None or self.target_lon is None:
             return None
-        g = Geodesic.WGS84.Inverse(self.current_lat, self.current_lon,
-                                   self.target_lat, self.target_lon)
-        return float(g['s12'])
-
-    # FCU / MAVROS helpers
-    def pull_waypoints(self) -> bool:
-        """Tarik daftar waypoints dari FCU. Saat dry_run -- True (untuk orkestrator)."""
-        if self.dry_run:
-            rospy.loginfo("[DRY] pull_waypoints() → TRUE")
-            return True
-        try:
-            res = self.srv_wp_pull()
-            ok = bool(res.success)
-            rospy.loginfo("WaypointPull: %s (pulled=%d)", "OK" if ok else "FAIL", res.wp_received)
-            return ok
-        except rospy.ServiceException as e:
-            rospy.logerr("Waypoint pull failed: %s", e)
-            return False
-
-    def arm(self) -> bool:
-        if not self.allow_arm:
-            rospy.logwarn("arm() blocked: allow_arm=False")
-            return False
-        if self.dry_run:
-            rospy.loginfo("[DRY] arm()")
-            return True
-        try:
-            res = self.srv_arm(True)
-            rospy.loginfo("Arm: %s", "OK" if res.success else "FAIL")
-            return bool(res.success)
-        except rospy.ServiceException as e:
-            rospy.logerr("Arm Service failed: %s", e)
-            return False
-
-    def disarm(self) -> bool:
-        if self.dry_run:
-            rospy.loginfo("[DRY] disarm()")
-            return True
-        try:
-            res = self.srv_arm(False)
-            rospy.loginfo("Disarm: %s", "OK" if res.success else "FAIL")
-            return bool(res.success)
-        except rospy.ServiceException as e:
-            rospy.logerr("Disarm Service failed: %s", e)
-            return False
-
-    def set_mode(self, mode: str) -> bool:
-        if self.dry_run:
-            rospy.loginfo("[DRY] set_mode(%s)", mode)
-            return True
-        try:
-            res = self.srv_mode(custom_mode=mode)
-            rospy.loginfo("SetMode(%s): %s", mode, "OK" if res.mode_sent else "FAIL")
-            return bool(res.mode_sent)
-        except rospy.ServiceException as e:
-            rospy.logerr("SetMode Service failed: %s", e)
-            return False
-
-    def set_param(self, param_id: str, integer: Optional[int] = None, real: Optional[float] = None) -> bool:
-        if self.dry_run:
-            rospy.loginfo("[DRY] set_param(%s) int=%s real=%s", param_id, str(integer), str(real))
-            return True
-        try:
-            pv = ParamValue()
-            pv.integer = int(integer) if integer is not None else 0
-            pv.real = float(real) if real is not None else 0.0
-            res = self.srv_param_set(param_id=param_id, value=pv)
-            rospy.loginfo("SetParam(%s): %s", param_id, "OK" if res.success else "FAIL")
-            return bool(res.success)
-        except rospy.ServiceException as e:
-            rospy.logerr("SetParam Service failed: %s", e)
-            return False
-
-    def get_param(self, param_id: str):
-        try:
-            res = self.srv_param_get(param_id=param_id)
-            rospy.loginfo("get_param(%s) -> int:%d real:%.6f", param_id, res.value.integer, res.value.real)
-            return res.value
-        except rospy.ServiceException as e:
-            rospy.logerr("GetParam Service failed: %s", e)
-            return None
-
-    def set_speed(self, speed_m_s: float) -> bool:
-        """Ubah speed target (MAV_CMD_DO_CHANGE_SPEED / 178)."""
-        self._ctr_set_speed_calls += 1
-
-        if self.dry_run:
-            now = time.time()
-            if (now - self._spd_last_log_t) >= self._set_speed_log_itvl or \
-               (self._spd_last_val is None) or \
-               (abs(speed_m_s - (self._spd_last_val or 0.0)) >= self._set_speed_log_delta):
-                rospy.loginfo("[DRY] set_speed(%.3f m/s)", speed_m_s)
-                self._spd_last_log_t = now
-                self._spd_last_val = speed_m_s
-            return True  
-
-        try:
-            res = self.srv_cmd_long(
-                broadcast=True,
-                command=178,
-                param1=1.0,   # speed type: ground speed
-                param2=float(speed_m_s),
-                param3=0.0, param4=0.0, param5=0.0, param6=0.0, param7=0.0
-            )
-
-            now = time.time()
-            success = bool(res.success)
-            should_log = (
-                (now - self._spd_last_log_t) >= self._set_speed_log_itvl or
-                (self._spd_last_val is None) or
-                (abs(speed_m_s - (self._spd_last_val or 0.0)) >= self._set_speed_log_delta) or
-                (self._spd_last_success is None) or
-                (success != self._spd_last_success)
-            )
-            if should_log:
-                rospy.loginfo("SetSpeed(%.2f): %s", speed_m_s, "OK" if success else "FAIL")
-                self._spd_last_log_t = now
-                self._spd_last_val = speed_m_s
-                self._spd_last_success = success
-            return success
-        except rospy.ServiceException as e:
-            rospy.logerr("SetSpeed failed: %s", e)
-            return False
-
-    # Aktuator (servo & relay)
-    def move_servo(self, pin_servo: int, pwm: float) -> bool:
-        """MAV_CMD_DO_SET_SERVO (183). pwm ~ 1000..2000"""
-        if self.dry_run:
-            rospy.loginfo("[DRY] move_servo pin=%d pwm=%.1f", pin_servo, pwm)
-            return True
-        try:
-            res = self.srv_cmd_long(
-                broadcast=False,
-                command=183, confirmation=0,
-                param1=float(pin_servo), param2=float(pwm),
-                param3=0.0, param4=0.0, param5=0.0, param6=0.0, param7=0.0
-            )
-            rospy.loginfo("SetServo(pin=%d,pwm=%.1f): %s", pin_servo, pwm, "OK" if res.success else "FAIL")
-            return bool(res.success)
-        except rospy.ServiceException as e:
-            rospy.logerr("SetServo failed: %s", e)
-            return False
-
-    def set_relay(self, pin_relay: int, value: bool) -> bool:
-        """MAV_CMD_DO_SET_RELAY (181). value: 0/1."""
-        if self.dry_run:
-            rospy.loginfo("[DRY] set_relay pin=%d val=%s", pin_relay, str(value))
-            return True
-        try:
-            res = self.srv_cmd_long(
-                broadcast=False,
-                command=181, confirmation=0,
-                param1=float(pin_relay),
-                param2=1.0 if value else 0.0,
-                param3=0.0, param4=0.0, param5=0.0, param6=0.0, param7=0.0
-            )
-            rospy.loginfo("SetRelay(pin=%d,val=%s): %s", pin_relay, str(value), "OK" if res.success else "FAIL")
-            return bool(res.success)
-        except rospy.ServiceException as e:
-            rospy.logerr("SetRelay failed: %s", e)
-            return False
-
-
-    def _report_close(self):
-        pass
-
-    def report(self, task: str, counts: dict = None, extra: dict = None, throttle_key: str = None):
+        
+        with self._gps_lock:
+            lat1 = math.radians(self.latitude)
+            lon1 = math.radians(self.longitude)
+        
+        lat2 = math.radians(self.target_lat)
+        lon2 = math.radians(self.target_lon)
+        
+        dlon = lon2 - lon1
+        
+        x = math.sin(dlon) * math.cos(lat2)
+        y = (math.cos(lat1) * math.sin(lat2) -
+             math.sin(lat1) * math.cos(lat2) * math.cos(dlon))
+        
+        bearing_rad = math.atan2(x, y)
+        bearing_deg = math.degrees(bearing_rad)
+        
+        # Normalize to 0-360
+        return (bearing_deg + 360) % 360
+    
+    def set_speed(self, speed_m_s):
         """
-        Kirim report generik.
-        - task: nama misi, mis. "pole", "avoid"
-        - counts: dict ringkas, mis. {"green":2,"red":1}
-        - extra: field tambahan (wp_index, note, dll.)
-        - throttle_key: kunci throttle; default=task
+        Set vehicle speed
+        
+        Args:
+            speed_m_s: Speed in m/s
+        
+        Returns:
+            bool: True if command sent successfully
+        """
+        with self._speed_lock:
+            try:
+                cmd = Twist()
+                cmd.linear.x = float(speed_m_s)
+                cmd.linear.y = 0.0
+                cmd.linear.z = 0.0
+                cmd.angular.z = 0.0
+                
+                self.cmd_vel_pub.publish(cmd)
+                self.speed = speed_m_s
+                
+                rospy.logdebug_throttle(2.0, f"[HANDLER] Speed set to {speed_m_s:.2f} m/s")
+                return True
+            except Exception as e:
+                rospy.logerr(f"[HANDLER] Failed to set speed: {e}")
+                return False
+    
+    def set_mode(self, mode):
+        """
+        Set vehicle mode
+        
+        Args:
+            mode: Mode string (e.g., "GUIDED", "AUTO")
+        
+        Returns:
+            bool: True if mode set successfully
+        """
+        try:
+            resp = self.set_mode_client(custom_mode=mode)
+            if resp.mode_sent:
+                rospy.loginfo(f"[HANDLER] Mode set to {mode}")
+                return True
+            else:
+                rospy.logwarn(f"[HANDLER] Failed to set mode to {mode}")
+                return False
+        except rospy.ServiceException as e:
+            rospy.logerr(f"[HANDLER] Service call failed: {e}")
+            return False
+    
+    def arm(self):
+        """Arm vehicle"""
+        try:
+            resp = self.arming_client(value=True)
+            if resp.success:
+                rospy.loginfo("[HANDLER] Vehicle ARMED")
+                return True
+            else:
+                rospy.logwarn("[HANDLER] Failed to ARM vehicle")
+                return False
+        except rospy.ServiceException as e:
+            rospy.logerr(f"[HANDLER] Arming service call failed: {e}")
+            return False
+    
+    def disarm(self):
+        """Disarm vehicle"""
+        try:
+            resp = self.arming_client(value=False)
+            if resp.success:
+                rospy.loginfo("[HANDLER] Vehicle DISARMED")
+                return True
+            else:
+                rospy.logwarn("[HANDLER] Failed to DISARM vehicle")
+                return False
+        except rospy.ServiceException as e:
+            rospy.logerr(f"[HANDLER] Disarming service call failed: {e}")
+            return False
+
+    # REPORTING METHODS
+    
+    def _should_throttle_report(self, throttle_key):
+        """
+        Check if report should be throttled
+        
+        Args:
+            throttle_key: Unique key for throttling (or None to disable)
+        
+        Returns:
+            bool: True if report should be skipped (throttled)
+        """
+        if throttle_key is None:
+            return False
+        
+        now = rospy.Time.now().to_sec()
+        
+        with self._report_lock:
+            last_time = self._last_report_time.get(throttle_key, 0.0)
+            
+            if now - last_time < REPORT_THROTTLE_INTERVAL:
+                return True
+            
+            self._last_report_time[throttle_key] = now
+            return False
+    
+    def report_gate_pass(self, gate_type, throttle_key="gate_pass"):
+        """
+        Report gate passage (Tasks 1, 3)
+        
+        Args:
+            gate_type: GateType enum value
+            throttle_key: Throttling key (None to disable throttle)
         """
         if not self.report_enable:
             return
-
-        key = throttle_key or task
-        now = rospy.Time.now().to_sec() if rospy.core.is_initialized() else time.time()
-        last = self._report_last_ts.get(key, 0.0)
-        if (now - last) < float(self.report_interval):
-            return
-        self._report_last_ts[key] = now
-
-        payload = {
-            "task": task,
-            "timestamp": now,
-            "lat": self.current_lat,
-            "lon": self.current_lon,
-            "counts": counts or {},
-        }
-        if extra:
-            payload.update(extra)
-
-        js = json.dumps(payload)
-
-        # publish topic
-        if self._report_pub is not None:
-            try:
-                self._report_pub.publish(String(data=js))
-            except Exception:
-                rospy.logdebug("Report publish failed")
-
-    # perf monitor tick
-    def _perf_tick(self, event):
-        now = time.time()
-        dt = max(1e-3, now - self._perf_last_t)
-        vel_rate = self._ctr_vel_pubs / dt
-        glob_rate = self._ctr_global_pubs / dt
-        spd_rate = self._ctr_set_speed_calls / dt
-        rospy.loginfo("[PERF] pubs/s vel=%.2f global=%.2f set_speed=%.2f (dt=%.1fs)",
-                      vel_rate, glob_rate, spd_rate, dt)
-        # reset counters
-        self._ctr_vel_pubs = 0
-        self._ctr_global_pubs = 0
-        self._ctr_set_speed_calls = 0
-        self._perf_last_t = now
-
-    # Callbacks
-    def _cb_gps(self, msg: NavSatFix) -> None:
-        self.current_lat = float(msg.latitude)
-        self.current_lon = float(msg.longitude)
-
-    def _cb_wps(self, msg: WaypointList) -> None:
-        self.latitude_array  = [wp.x_lat for wp in msg.waypoints]
-        self.longitude_array = [wp.y_long for wp in msg.waypoints]
-        rospy.loginfo("Waypoints synced: %d", len(self.latitude_array))
-
-    def _cb_state(self, msg: State) -> None:
-        if self.armed and not msg.armed:
-            rospy.logwarn("Vehicle disarmed by FCU.")
-        self.armed = bool(msg.armed)
-
-    def _cb_compass(self, msg: Float64) -> None:
-        """Callback heading kompas dari /mavros/global_position/compass_hdg (derajat)."""
-        try:
-            self.current_heading_deg = float(msg.data)
-        except Exception:
-            self.current_heading_deg = 0.0
-
-    def _cb_pose_local(self, msg: PoseStamped) -> None:
-        q = msg.pose.orientation
-        p = msg.pose.position
-
-        # kalau tf.transformations tersedia, pakai itu
-        if tft is not None:
-            try:
-                # tf euler_from_quaternion butuh list [x,y,z,w]
-                roll, pitch, yaw = tft.euler_from_quaternion([q.x, q.y, q.z, q.w])
-            except Exception:
-                # kalau tf error, fallback ke implementasi manual
-                roll, pitch, yaw = self._euler_from_quaternion(q)
-        else:
-            # kalau tf tidak tersedia, langsung pakai implementasi manual
-            roll, pitch, yaw = self._euler_from_quaternion(q)
-
-        self.current_roll  = roll
-        self.current_pitch = pitch
-        self.current_yaw   = yaw
-
-        self.p_x, self.p_y, self.p_z = p.x, p.y, p.z
-
-    def _cb_lidar(self, msg: LaserScan) -> None:
-        try:
-            n = len(msg.ranges)
-            if n > 0:
-                self.front_distance = msg.ranges[n // 2]
-                if n >= 20:
-                    self.left_distance  = min(msg.ranges[:20])
-                    self.right_distance = min(msg.ranges[-20:])
-        except Exception:
-            pass
-
-    def _cb_home(self, msg: HomePosition) -> None:
-        """Callback untuk menyimpan home position (origin ENU)."""
-        new_lat = float(msg.geo.latitude)
-        new_lon = float(msg.geo.longitude)
         
-        # Simpan hanya jika belum ada, atau jika berubah (jarang terjadi)
-        if self.home_lat is None or self.home_lon is None:
-            self.home_lat = new_lat
-            self.home_lon = new_lon
-            rospy.loginfo(f"Home position (origin) TERSIMPAN: Lat={new_lat}, Lon={new_lon}")
-
-    # Math utils
-    def _euler_from_quaternion(self, q: Quaternion) -> Tuple[float, float, float]:
-        """Quaternion -> euler roll, pitch, yaw (rad)."""
-        x, y, z, w = q.x, q.y, q.z, q.w
-        # roll (x)
-        sinr_cosp = 2.0 * (w * x + y * z)
-        cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
-        roll = math.atan2(sinr_cosp, cosr_cosp)
-        # pitch (y)
-        sinp = 2.0 * (w * y - z * x)
-        if abs(sinp) >= 1:
-            pitch = math.copysign(math.pi / 2, sinp)
-        else:
-            pitch = math.asin(sinp)
-        # yaw (z)
-        siny_cosp = 2.0 * (w * z + x * y)
-        cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
-        yaw = math.atan2(siny_cosp, cosy_cosp)
-        return roll, pitch, yaw
-
-    def get_azimuth(self, p1: Tuple[float, float], p2: Tuple[float, float],
-                    cond: int = 2, ref_heading_deg: float = 0.0) -> float:
+        if self._should_throttle_report(throttle_key):
+            return
+        
+        with self._gps_lock:
+            position = (self.latitude, self.longitude)
+        
+        self.reporter.send_gate_pass(gate_type, position)
+    
+    def report_object_detected(self, object_type, color, object_id, task_context, throttle_key=None):
         """
-        Hitung azimuth (derajat) dari p1 -> p2.
-        cond=1 -- (azi - ref_heading_deg)
-        cond=2 -- azi di [0..360)
+        Report object detection (Tasks 2, 3, 4)
+        
+        Args:
+            object_type: ObjectType enum value
+            color: Color enum value
+            object_id: Unique object ID
+            task_context: TaskType enum value
+            throttle_key: Throttling key (None to disable throttle)
         """
-        geo = Geodesic.WGS84
-        rs = geo.Inverse(p1[0], p1[1], p2[0], p2[1])
-        azi = float(rs['azi1'])
-        if cond == 1:
-            return azi - ref_heading_deg
-        return azi + 360.0 if azi < 0.0 else azi
+        if not self.report_enable:
+            return
+        
+        if self._should_throttle_report(throttle_key):
+            return
+        
+        with self._gps_lock:
+            position = (self.latitude, self.longitude)
+        
+        self.reporter.send_object_detected(
+            object_type, color, position, object_id, task_context
+        )
+    
+    def set_current_task(self, task_type):
+        """
+        Update current task for reporter
+        
+        Args:
+            task_type: TaskType enum value
+        """
+        if self.report_enable:
+            self.reporter.set_task(task_type)
 
-    # v4l2 helpers
-    def set_v4l2(self, control: str, value: int) -> None:
-        """Set satu kontrol v4l2-ctl (brightness/contrast/saturation/...)."""
-        try:
-            if shutil.which("v4l2-ctl") is None:
-                rospy.logwarn("v4l2-ctl tidak ditemukan di PATH.")
-                return
-            cmd = f"v4l2-ctl --set-ctrl={control}={value}"
-            subprocess.run(cmd, shell=True, check=False)
-            rospy.loginfo("v4l2 set %s=%d", control, value)
-        except Exception as e:
-            rospy.logwarn("v4l2 failed: %s", e)
+    # LEGACY REPORT METHOD
+    
+    def report(self, task, counts, extra=None, throttle_key="legacy"):
+        """
+        Legacy report method for backward compatibility
+        
+        Args:
+            task: Task name string
+            counts: Dict of detected object counts
+            extra: Extra metadata dict
+            throttle_key: Throttling key
+        """
+        if not self.report_enable:
+            return
+        
+        if self._should_throttle_report(throttle_key):
+            return
+        
+        # Log report
+        rospy.logdebug_throttle(1.0, 
+            f"[HANDLER] Report: task={task}, counts={counts}, extra={extra}")
+
+    # CLEANUP
+    
+    def shutdown(self):
+        """Shutdown handler and close connections"""
+        rospy.loginfo("[HANDLER] Shutting down MandaHandler...")
+        
+        # Stop heartbeat and close reporter
+        if self.report_enable:
+            self.reporter.close()
+        
+        rospy.loginfo("[HANDLER] Shutdown complete")
 
 
-def main():
-    rospy.init_node('manda_handler', anonymous=False)
-    node = MandaHandler()
-    rospy.spin()
-
+# MAIN (for testing)
 
 if __name__ == '__main__':
-    main()
+    try:
+        rospy.init_node('manda_handler_test', anonymous=True)
+        handler = MandaHandler()
+        rospy.spin()
+    except rospy.ROSInterruptException:
+        pass
