@@ -231,12 +231,13 @@ def shutdown_handler():
     FIX: Proper shutdown sequence untuk menghindari segfault.
     Urutan PENTING:
     1. Stop robot movement (safety)
-    2. Reset FCU parameters
-    3. Release camera
-    4. Close OpenCV windows
-    5. Cleanup TRT engines
-    6. Cleanup CUDA context
-    7. Stop LiDAR
+    2. Shutdown MandaHandler (stop heartbeat & close reporter) - FIXED!
+    3. Reset FCU parameters
+    4. Release camera
+    5. Close OpenCV windows
+    6. Cleanup TRT engines
+    7. Cleanup CUDA context
+    8. Stop LiDAR
     """
     global _manda_handler, _camera, _lidar_proc, _shutdown_done
     
@@ -259,7 +260,18 @@ def shutdown_handler():
     except Exception as e:
         rospy.logwarn("[SHUTDOWN] Error stopping robot: %s", e)
     
-    # 2. Reset MandaHandler parameters to safe defaults
+    # 2. Shutdown MandaHandler (CRITICAL FIX - Added!)
+    try:
+        if _manda_handler is not None:
+            try:
+                _manda_handler.shutdown()
+                rospy.loginfo("[SHUTDOWN] MandaHandler shutdown complete")
+            except Exception as e:
+                rospy.logerr("[SHUTDOWN] MandaHandler shutdown error: %s", e)
+    except Exception as e:
+        rospy.logerr("[SHUTDOWN] Error during MandaHandler shutdown: %s", e)
+    
+    # 3. Reset FCU parameters to safe defaults
     try:
         if _manda_handler is not None:
             rospy.loginfo("[SHUTDOWN] Resetting FCU parameters...")
@@ -287,9 +299,9 @@ def shutdown_handler():
                 rospy.logwarn("[SHUTDOWN] Failed to reset actuators: %s", e)
                 
     except Exception as e:
-        rospy.logerr("[SHUTDOWN] Error during manda_handler cleanup: %s", e)
+        rospy.logerr("[SHUTDOWN] Error during FCU parameter reset: %s", e)
     
-    # 3. Release kamera SEBELUM TRT cleanup
+    # 4. Release kamera SEBELUM TRT cleanup
     try:
         if _camera is not None:
             rospy.loginfo("[SHUTDOWN] Releasing camera...")
@@ -299,7 +311,7 @@ def shutdown_handler():
     except Exception as e:
         rospy.logwarn("[SHUTDOWN] Failed to release camera: %s", e)
     
-    # 4. Tutup semua window OpenCV
+    # 5. Tutup semua window OpenCV
     try:
         rospy.loginfo("[SHUTDOWN] Closing OpenCV windows...")
         cv2.destroyAllWindows()
@@ -307,19 +319,19 @@ def shutdown_handler():
     except Exception as e:
         rospy.logwarn("[SHUTDOWN] Failed to close OpenCV windows: %s", e)
     
-    # 5. Cleanup TensorRT engines SEBELUM CUDA context
+    # 6. Cleanup TensorRT engines SEBELUM CUDA context
     try:
         _cleanup_engines()
     except Exception as e:
         rospy.logerr("[SHUTDOWN] TRT cleanup error: %s", e)
     
-    # 6. Cleanup CUDA context terakhir
+    # 7. Cleanup CUDA context terakhir
     try:
         _cleanup_cuda_context()
     except Exception as e:
         rospy.logerr("[SHUTDOWN] CUDA cleanup error: %s", e)
     
-    # 7. Stop LiDAR process jika ada
+    # 8. Stop LiDAR process jika ada
     try:
         _stop_lidar(_lidar_proc)
     except Exception as e:
@@ -642,9 +654,9 @@ def main():
     lidar_proc = _start_lidar_if_needed(args, mission_plan)
     _lidar_proc = lidar_proc
 
-    # Auto set mode + arm
+    # Auto set mode + arm (FIXED - removed dry_run check)
     mode = "GUIDED"
-    if not manda.dry_run and getattr(manda, "allow_arm", True):
+    if getattr(manda, "allow_arm", True):
         if not manda.set_mode(mode):
             rospy.logwarn("Set mode %s gagal, coba GUIDED_NOGPS", mode)
             if not manda.set_mode("GUIDED_NOGPS"):
